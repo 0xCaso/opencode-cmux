@@ -20,6 +20,14 @@ const plugin: Plugin = async ({ client, $ }) => {
     return trimmed === "" ? undefined : trimmed
   }
 
+  function getQuestionRequestID(source: any): string | undefined {
+    if (!source) return undefined
+    const rawID = source.id ?? source.requestID
+    if (typeof rawID !== "string") return undefined
+    const trimmed = rawID.trim()
+    return trimmed === "" ? undefined : trimmed
+  }
+
   async function fetchSession(
     sessionID: string,
   ): Promise<{ title: string; parentID?: string } | null> {
@@ -57,7 +65,7 @@ const plugin: Plugin = async ({ client, $ }) => {
         if (status.type === "idle") {
           // If we're waiting for user input (permission prompt or question),
           // the session goes idle because the model is not generating — but
-          // we are NOT done.  Keep the current sidebar status and skip the
+          // we are NOT done. Keep the current sidebar status and skip the
           // "Done" notification.
           if (isWaitingForInput()) {
             return
@@ -141,8 +149,10 @@ const plugin: Plugin = async ({ client, $ }) => {
 
       // Handle question events
       if (e.type === "question.asked") {
-        const id = e.properties.id
-        pendingQuestions.add(id)
+        const id = getQuestionRequestID(e.properties)
+        if (id) {
+          pendingQuestions.add(id)
+        }
 
         const header = e.properties.questions?.[0]?.header ?? "Question"
         await setStatus($, "opencode", "question", {
@@ -155,8 +165,10 @@ const plugin: Plugin = async ({ client, $ }) => {
       }
 
       if (e.type === "question.replied" || e.type === "question.rejected") {
-        const id = e.properties.requestID
-        pendingQuestions.delete(id)
+        const id = getQuestionRequestID(e.properties)
+        if (id) {
+          pendingQuestions.delete(id)
+        }
 
         if (!isWaitingForInput()) {
           await setStatus($, "opencode", "working", {
@@ -170,7 +182,7 @@ const plugin: Plugin = async ({ client, $ }) => {
 
     async "permission.ask"(input) {
       // The hook fires synchronously in the permission pipeline, before the
-      // event.  Record it eagerly so the idle-suppression logic is already
+      // event. Record it eagerly so the idle-suppression logic is already
       // active when session.status arrives.
       const id = getPermissionRequestID(input as any)
       if (id) {
@@ -180,7 +192,7 @@ const plugin: Plugin = async ({ client, $ }) => {
       const title = (input as any).title ?? (input as any).permission ?? "command"
       await setStatus($, "opencode", "waiting", {
         icon: "lock",
-        color "#ef4444",
+        color: "#ef4444",
       })
       await notify($, { title: "Needs your permission", subtitle: title })
       await log($, `Permission requested: ${title}`, {
