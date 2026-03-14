@@ -12,6 +12,14 @@ const plugin: Plugin = async ({ client, $ }) => {
     return pendingPermissions.size > 0 || pendingQuestions.size > 0
   }
 
+  function getPermissionRequestID(source: any): string | undefined {
+    if (!source) return undefined
+    const rawID = source.id ?? source.requestID ?? source.permissionID
+    if (typeof rawID !== "string") return undefined
+    const trimmed = rawID.trim()
+    return trimmed === "" ? undefined : trimmed
+  }
+
   async function fetchSession(
     sessionID: string,
   ): Promise<{ title: string; parentID?: string } | null> {
@@ -97,8 +105,8 @@ const plugin: Plugin = async ({ client, $ }) => {
       // Handle permission events (belt-and-suspenders with the permission.ask hook)
       // v2: "permission.asked", v1: "permission.updated"
       if (e.type === "permission.asked" || e.type === "permission.updated") {
-        const id = e.properties.id
-        if (!pendingPermissions.has(id)) {
+        const id = getPermissionRequestID(e.properties)
+        if (id && !pendingPermissions.has(id)) {
           pendingPermissions.add(id)
           const title = e.properties.title ?? e.properties.permission ?? "command"
           await setStatus($, "opencode", "waiting", {
@@ -115,8 +123,10 @@ const plugin: Plugin = async ({ client, $ }) => {
       }
 
       if (e.type === "permission.replied") {
-        const id = e.properties.requestID ?? e.properties.permissionID
-        pendingPermissions.delete(id)
+        const id = getPermissionRequestID(e.properties)
+        if (id) {
+          pendingPermissions.delete(id)
+        }
 
         if (!isWaitingForInput()) {
           // No more pending input — restore "working" since the session will
@@ -162,7 +172,7 @@ const plugin: Plugin = async ({ client, $ }) => {
       // The hook fires synchronously in the permission pipeline, before the
       // event.  Record it eagerly so the idle-suppression logic is already
       // active when session.status arrives.
-      const id = (input as any).id
+      const id = getPermissionRequestID(input as any)
       if (id) {
         pendingPermissions.add(id)
       }
@@ -170,7 +180,7 @@ const plugin: Plugin = async ({ client, $ }) => {
       const title = (input as any).title ?? (input as any).permission ?? "command"
       await setStatus($, "opencode", "waiting", {
         icon: "lock",
-        color: "#ef4444",
+        color "#ef4444",
       })
       await notify($, { title: "Needs your permission", subtitle: title })
       await log($, `Permission requested: ${title}`, {
