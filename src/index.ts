@@ -1,12 +1,73 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { notify, setStatus, clearStatus, log } from "./cmux.js"
+import {
+  notify,
+  setStatus,
+  clearStatus,
+  log,
+  createSplit,
+  closeSurface,
+  focusSurface,
+  sendToSurface,
+  sendKeyToSurface,
+  type SplitDirection,
+} from "./cmux.js"
 
-const plugin: Plugin = async ({ client, $ }) => {
-  // Track pending user-input requests so that session.status "idle" events
-  // (which fire while the model is not generating) don't prematurely clear
-  // the sidebar or send spurious "Done" notifications.
+const plugin: Plugin = async ({ client, $, serverUrl }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
+
+  const originalSurfaceId = process.env.CMUX_SURFACE_ID
+
+  let resolvedServerUrl = ""
+  let splitsEnabled = false
+  try {
+    const raw = serverUrl?.toString() ?? ""
+    const parsed = new URL(raw)
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80")
+    if (port !== "0") {
+      if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
+        parsed.hostname = "localhost"
+      }
+      resolvedServerUrl = parsed.toString().replace(/\/$/, "")
+      splitsEnabled = true
+    }
+  } catch {
+    // swallow errors silently
+  }
+
+  const activeSplits = new Map<string, string>()
+
+  // Rightmost surface in each of the 3 rows (top-right, bottom-right, bottom-left)
+  // Used as split targets when adding new columns
+  const rowFrontier: (string | undefined)[] = [undefined, undefined, undefined]
+  let agentCount = 0
+
+  let splitQueue = Promise.resolve<unknown>(undefined)
+  function enqueueSplitOp<T>(fn: () => Promise<T>): Promise<T> {
+    const result = splitQueue.then(fn, fn)
+    splitQueue = result.then(
+      () => {},
+      () => {},
+    )
+    return result as Promise<T>
+  }
+
+  function resetGridState(): void {
+    rowFrontier[0] = undefined
+    rowFrontier[1] = undefined
+    rowFrontier[2] = undefined
+    agentCount = 0
+  }
+
+  function removeAndClose(sessionId: string): void {
+    const surfaceId = activeSplits.get(sessionId)
+    if (!surfaceId) return
+    activeSplits.delete(sessionId)
+    closeSurface($, surfaceId).catch(() => {})
+    if (activeSplits.size === 0) {
+      resetGridState()
+    }
+  }
 
   function isWaitingForInput(): boolean {
     return pendingPermissions.size > 0 || pendingQuestions.size > 0
@@ -46,13 +107,66 @@ const plugin: Plugin = async ({ client, $ }) => {
     async event({ event }) {
       const e = event as any
 
-      // Handle session status changes (busy/idle/retry)
+      if (e.type === "session.created") {
+        const info = e.properties.info
+        if (info?.parentID && splitsEnabled) {
+          await enqueueSplitOp(async () => {
+            if (activeSplits.has(info.id)) return
+
+            let direction: SplitDirection
+            let fromSurface: string | undefined
+            const n = agentCount
+
+            if (n === 0) {
+              direction = "right"
+              fromSurface = originalSurfaceId
+            } else if (n === 1) {
+              direction = "down"
+              fromSurface = rowFrontier[0]
+            } else if (n === 2) {
+              direction = "down"
+              fromSurface = originalSurfaceId
+            } else {
+              const rowIdx = (n - 3) % 3
+              direction = "right"
+              fromSurface = rowFrontier[rowIdx]
+            }
+
+            const surfaceId = await createSplit($, direction, fromSurface)
+            if (!surfaceId) return
+
+            if (n < 3) {
+              rowFrontier[n] = surfaceId
+            } else {
+              const rowIdx = (n - 3) % 3
+              rowFrontier[rowIdx] = surfaceId
+            }
+
+            activeSplits.set(info.id, surfaceId)
+            agentCount++
+
+            const attachCmd = `opencode attach ${resolvedServerUrl} --session ${info.id}`
+            await sendToSurface($, surfaceId, attachCmd)
+            await sendKeyToSurface($, surfaceId, "enter")
+
+            if (originalSurfaceId) {
+              await focusSurface($, originalSurfaceId)
+            }
+          })
+        }
+        return
+      }
+
+      if (e.type === "session.deleted") {
+        const info = e.properties.info
+        if (info?.id) removeAndClose(info.id)
+        return
+      }
+
       if (e.type === "session.status") {
         const { sessionID, status } = e.properties
 
         if (status.type === "busy") {
-          // Only set "working" if we're not already waiting for user input;
-          // the more-specific waiting/question status should take priority.
           if (!isWaitingForInput()) {
             await setStatus($, "opencode", "working", {
               icon: "terminal",
@@ -63,10 +177,6 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         if (status.type === "idle") {
-          // If we're waiting for user input (permission prompt or question),
-          // the session goes idle because the model is not generating — but
-          // we are NOT done. Keep the current sidebar status and skip the
-          // "Done" notification.
           if (isWaitingForInput()) {
             return
           }
@@ -75,24 +185,22 @@ const plugin: Plugin = async ({ client, $ }) => {
           const title = session?.title ?? sessionID
 
           if (!session?.parentID) {
-            // Primary session
             await notify($, { title: `Done: ${title}` })
             await log($, `Done: ${title}`, { level: "success", source: "opencode" })
             await clearStatus($, "opencode")
           } else {
-            // Subagent session — log only, no notify/clearStatus to avoid spam
             await log($, `Subagent finished: ${title}`, {
               level: "info",
               source: "opencode",
             })
+
+            removeAndClose(sessionID)
           }
           return
         }
       }
 
-      // Handle session errors
       if (e.type === "session.error") {
-        // Clear any pending state — the session errored out
         pendingPermissions.clear()
         pendingQuestions.clear()
 
@@ -107,11 +215,11 @@ const plugin: Plugin = async ({ client, $ }) => {
           source: "opencode",
         })
         await clearStatus($, "opencode")
+
+        if (sessionID) removeAndClose(sessionID)
         return
       }
 
-      // Handle permission events (belt-and-suspenders with the permission.ask hook)
-      // v2: "permission.asked", v1: "permission.updated"
       if (e.type === "permission.asked" || e.type === "permission.updated") {
         const id = getPermissionRequestID(e.properties)
         if (id && !pendingPermissions.has(id)) {
@@ -137,8 +245,6 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         if (!isWaitingForInput()) {
-          // No more pending input — restore "working" since the session will
-          // resume, or let the next idle event handle cleanup.
           await setStatus($, "opencode", "working", {
             icon: "terminal",
             color: "#f59e0b",
@@ -147,7 +253,6 @@ const plugin: Plugin = async ({ client, $ }) => {
         return
       }
 
-      // Handle question events
       if (e.type === "question.asked") {
         const id = getQuestionRequestID(e.properties)
         if (id) {
@@ -181,9 +286,6 @@ const plugin: Plugin = async ({ client, $ }) => {
     },
 
     async "permission.ask"(input) {
-      // The hook fires synchronously in the permission pipeline, before the
-      // event. Record it eagerly so the idle-suppression logic is already
-      // active when session.status arrives.
       const id = getPermissionRequestID(input as any)
       if (id) {
         pendingPermissions.add(id)
@@ -199,7 +301,6 @@ const plugin: Plugin = async ({ client, $ }) => {
         level: "info",
         source: "opencode",
       })
-      // Return undefined — do not block the permission
     },
   }
 }
