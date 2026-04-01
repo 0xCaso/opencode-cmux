@@ -71,3 +71,81 @@ export async function log(
     // swallow errors silently
   }
 }
+
+export type SplitDirection = "right" | "down"
+
+/**
+ * Create a new split pane. Returns the new surface ref (e.g. "surface:5"),
+ * or `null` on failure. When `fromSurface` is provided the split is created
+ * relative to that surface instead of the currently focused one.
+ */
+export async function createSplit(
+  $: Shell,
+  direction: SplitDirection,
+  fromSurface?: string,
+): Promise<string | null> {
+  if (!isInCmux()) return null
+  try {
+    const args: string[] = [direction]
+    if (fromSurface) args.push("--surface", fromSurface)
+    const result = await $`cmux new-split ${args}`.quiet().nothrow()
+    const text = result.text().trim()
+    if (!text) return null
+    // Output format: "OK surface:<n> workspace:<n>"
+    const match = text.match(/surface:\S+/)
+    return match ? match[0] : null
+  } catch {
+    return null
+  }
+}
+
+export async function focusSurface(
+  $: Shell,
+  surfaceId: string,
+): Promise<void> {
+  if (!isInCmux()) return
+  try {
+    await $`cmux focus-surface --surface ${surfaceId}`.quiet().nothrow()
+  } catch {
+    // swallow errors silently
+  }
+}
+
+export async function sendToSurface(
+  $: Shell,
+  surfaceId: string,
+  text: string,
+): Promise<void> {
+  if (!isInCmux()) return
+  try {
+    const args = ["--surface", surfaceId, text]
+    await $`cmux send ${args}`.quiet().nothrow()
+  } catch {
+    // swallow errors silently
+  }
+}
+
+export async function sendKeyToSurface(
+  $: Shell,
+  surfaceId: string,
+  key: string,
+): Promise<void> {
+  if (!isInCmux()) return
+  try {
+    await $`cmux send-key --surface ${surfaceId} ${key}`.quiet().nothrow()
+  } catch {
+    // swallow errors silently
+  }
+}
+
+export async function closeSurface(
+  $: Shell,
+  surfaceId: string,
+): Promise<void> {
+  if (!isInCmux()) return
+  try {
+    await $`cmux close-surface --surface ${surfaceId}`.quiet().nothrow()
+  } catch {
+    // swallow errors silently
+  }
+}
