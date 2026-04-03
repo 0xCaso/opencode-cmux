@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin"
+import { execSync } from "node:child_process"
 import {
   notify,
   setStatus,
@@ -12,33 +13,56 @@ import {
   type SplitDirection,
 } from "./cmux.js"
 
-const plugin: Plugin = async (input) => {
-  const { client, $ } = input
+const plugin: Plugin = async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
-  // Resolve the server URL lazily (on each call) instead of at init time.
-  // `serverUrl` is a getter on the plugin input that returns a fallback
-  // (http://localhost:4096) until the HTTP server has actually bound to a
-  // port.  Reading it later — when a subagent split is needed — gives the
-  // getter time to return the real URL.
+  // Discover the actual server URL for `opencode attach`.
+  //
+  // The TUI does not start an HTTP server unless --port is passed.
+  // Neither the serverUrl plugin input nor the SDK client baseUrl are
+  // reliable — both report http://localhost:4096 regardless of the
+  // actual bound port (the SDK uses in-process fetch, not HTTP).
+  //
+  // We use lsof to find the TCP port this process is actually listening on.
+  // Returns null when no HTTP server is running (splits are skipped).
   // See: https://github.com/anomalyco/opencode/issues/9099
+  let discoveredServerUrl: string | null | undefined
   function resolveServerUrl(): string | null {
-    try {
-      const raw =
-        process.env.OPENCODE_SERVER_URL ?? input.serverUrl?.toString() ?? ""
-      const parsed = new URL(raw)
-      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80")
-      if (port === "0") return null
-      if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
-        parsed.hostname = "localhost"
-      }
-      return parsed.toString().replace(/\/$/, "")
-    } catch {
-      return null
+    if (discoveredServerUrl !== undefined) return discoveredServerUrl
+
+    // 1. Env var (future-proof for when anomalyco/opencode#9099 lands)
+    if (process.env.OPENCODE_SERVER_URL) {
+      try {
+        const parsed = new URL(process.env.OPENCODE_SERVER_URL)
+        if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
+          parsed.hostname = "localhost"
+        }
+        discoveredServerUrl = parsed.toString().replace(/\/$/, "")
+        return discoveredServerUrl
+      } catch {}
     }
+
+    // 2. Find the TCP port this process is listening on via lsof.
+    //    Use -a to AND the -p and -iTCP filters (macOS lsof ORs by default).
+    try {
+      const out = execSync(
+        `lsof -nP -a -p ${process.pid} -iTCP -sTCP:LISTEN 2>/dev/null`,
+        { encoding: "utf-8", timeout: 3000 },
+      )
+      for (const line of out.split("\n")) {
+        const match = line.match(/:(\d+)\s+\(LISTEN\)/)
+        if (match) {
+          discoveredServerUrl = `http://localhost:${match[1]}`
+          return discoveredServerUrl
+        }
+      }
+    } catch {}
+
+    discoveredServerUrl = null
+    return null
   }
 
   const activeSplits = new Map<string, string>()
