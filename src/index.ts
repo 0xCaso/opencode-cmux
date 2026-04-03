@@ -12,27 +12,33 @@ import {
   type SplitDirection,
 } from "./cmux.js"
 
-const plugin: Plugin = async ({ client, $, serverUrl }) => {
+const plugin: Plugin = async (input) => {
+  const { client, $ } = input
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
-  let resolvedServerUrl = ""
-  let splitsEnabled = false
-  try {
-    const raw = serverUrl?.toString() ?? ""
-    const parsed = new URL(raw)
-    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80")
-    if (port !== "0") {
+  // Resolve the server URL lazily (on each call) instead of at init time.
+  // `serverUrl` is a getter on the plugin input that returns a fallback
+  // (http://localhost:4096) until the HTTP server has actually bound to a
+  // port.  Reading it later — when a subagent split is needed — gives the
+  // getter time to return the real URL.
+  // See: https://github.com/anomalyco/opencode/issues/9099
+  function resolveServerUrl(): string | null {
+    try {
+      const raw =
+        process.env.OPENCODE_SERVER_URL ?? input.serverUrl?.toString() ?? ""
+      const parsed = new URL(raw)
+      const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80")
+      if (port === "0") return null
       if (parsed.hostname === "0.0.0.0" || parsed.hostname === "[::]") {
         parsed.hostname = "localhost"
       }
-      resolvedServerUrl = parsed.toString().replace(/\/$/, "")
-      splitsEnabled = true
+      return parsed.toString().replace(/\/$/, "")
+    } catch {
+      return null
     }
-  } catch {
-    // swallow errors silently
   }
 
   const activeSplits = new Map<string, string>()
@@ -109,7 +115,8 @@ const plugin: Plugin = async ({ client, $, serverUrl }) => {
 
       if (e.type === "session.created") {
         const info = e.properties.info
-        if (info?.parentID && splitsEnabled) {
+        const url = info?.parentID ? resolveServerUrl() : null
+        if (info?.parentID && url) {
           await enqueueSplitOp(async () => {
             if (activeSplits.has(info.id)) return
 
@@ -145,7 +152,7 @@ const plugin: Plugin = async ({ client, $, serverUrl }) => {
             activeSplits.set(info.id, surfaceId)
             agentCount++
 
-            const attachCmd = `opencode attach ${resolvedServerUrl} --session ${info.id}`
+            const attachCmd = `opencode attach ${url} --session ${info.id}`
             await sendToSurface($, surfaceId, attachCmd)
             await sendKeyToSurface($, surfaceId, "enter")
 
