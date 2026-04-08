@@ -32,6 +32,16 @@ ln -sf ~/path/to/opencode-cmux/dist/index.js ~/.config/opencode/plugins/cmux.js
 
 Make sure `opencode-cmux` is **not** listed in `opencode.json` when using the symlink, to avoid loading it twice.
 
+## Subagent splits
+
+When a subagent spawns, the plugin opens a cmux split with a live `opencode attach` view. Requires `--port` to expose an HTTP server:
+
+```bash
+opencode --port 0  # binds to first available port
+```
+
+Without `--port`, splits are silently skipped.
+
 ## What it does
 
 | Event | cmux action |
