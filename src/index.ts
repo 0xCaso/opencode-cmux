@@ -1,5 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "node:child_process"
+import { readFileSync } from "node:fs"
+import { homedir } from "node:os"
 import {
   notify,
   setStatus,
@@ -18,6 +20,19 @@ const plugin: Plugin = async ({ client, $ }) => {
   const pendingQuestions = new Set<string>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
+
+  // Read plugin config (once at init)
+  let splitsEnabled = false
+  try {
+    const configPath = `${homedir()}/.config/opencode/opencode-cmux.json`
+    const raw = readFileSync(configPath, "utf-8")
+    const config = JSON.parse(raw)
+    if (config.splits === true) {
+      splitsEnabled = true
+    }
+  } catch {
+    // File missing, unreadable, or invalid JSON — use defaults
+  }
 
   // Discover the actual server URL for `opencode attach`.
   //
@@ -139,51 +154,53 @@ const plugin: Plugin = async ({ client, $ }) => {
 
       if (e.type === "session.created") {
         const info = e.properties.info
-        const url = info?.parentID ? resolveServerUrl() : null
-        if (info?.parentID && url) {
-          await enqueueSplitOp(async () => {
-            if (activeSplits.has(info.id)) return
+        if (splitsEnabled && info?.parentID) {
+          const url = resolveServerUrl()
+          if (url) {
+            await enqueueSplitOp(async () => {
+              if (activeSplits.has(info.id)) return
 
-            let direction: SplitDirection
-            let fromSurface: string | undefined
-            const n = agentCount
+              let direction: SplitDirection
+              let fromSurface: string | undefined
+              const n = agentCount
 
-            if (n === 0) {
-              direction = "right"
-              fromSurface = originalSurfaceId
-            } else if (n === 1) {
-              direction = "down"
-              fromSurface = rowFrontier[0]
-            } else if (n === 2) {
-              direction = "down"
-              fromSurface = originalSurfaceId
-            } else {
-              const rowIdx = (n - 3) % 3
-              direction = "right"
-              fromSurface = rowFrontier[rowIdx]
-            }
+              if (n === 0) {
+                direction = "right"
+                fromSurface = originalSurfaceId
+              } else if (n === 1) {
+                direction = "down"
+                fromSurface = rowFrontier[0]
+              } else if (n === 2) {
+                direction = "down"
+                fromSurface = originalSurfaceId
+              } else {
+                const rowIdx = (n - 3) % 3
+                direction = "right"
+                fromSurface = rowFrontier[rowIdx]
+              }
 
-            const surfaceId = await createSplit($, direction, fromSurface)
-            if (!surfaceId) return
+              const surfaceId = await createSplit($, direction, fromSurface)
+              if (!surfaceId) return
 
-            if (n < 3) {
-              rowFrontier[n] = surfaceId
-            } else {
-              const rowIdx = (n - 3) % 3
-              rowFrontier[rowIdx] = surfaceId
-            }
+              if (n < 3) {
+                rowFrontier[n] = surfaceId
+              } else {
+                const rowIdx = (n - 3) % 3
+                rowFrontier[rowIdx] = surfaceId
+              }
 
-            activeSplits.set(info.id, surfaceId)
-            agentCount++
+              activeSplits.set(info.id, surfaceId)
+              agentCount++
 
-            const attachCmd = `opencode attach ${url} --session ${info.id}`
-            await sendToSurface($, surfaceId, attachCmd)
-            await sendKeyToSurface($, surfaceId, "enter")
+              const attachCmd = `opencode attach ${url} --session ${info.id}`
+              await sendToSurface($, surfaceId, attachCmd)
+              await sendKeyToSurface($, surfaceId, "enter")
 
-            if (originalSurfaceId) {
-              await focusSurface($, originalSurfaceId)
-            }
-          })
+              if (originalSurfaceId) {
+                await focusSurface($, originalSurfaceId)
+              }
+            })
+          }
         }
         return
       }
