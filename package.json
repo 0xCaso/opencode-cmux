@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-cmux",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "OpenCode plugin that bridges OpenCode events to cmux notifications and sidebar metadata",
   "type": "module",
   "main": "dist/index.js",
