@@ -23,12 +23,45 @@ const plugin: Plugin = async ({ client, $ }) => {
 
   // Read plugin config (once at init)
   let splitsEnabled = false
+  const notifyOn: { done: boolean; permission: boolean; question: boolean; error: boolean } = {
+    done: true,
+    permission: true,
+    question: true,
+    error: true,
+  }
   try {
     const configPath = `${homedir()}/.config/opencode/opencode-cmux.json`
     const raw = readFileSync(configPath, "utf-8")
     const config = JSON.parse(raw)
     if (config.splits === true) {
       splitsEnabled = true
+    }
+    if (config.notifications !== undefined) {
+      if (
+        typeof config.notifications === "object" &&
+        config.notifications !== null &&
+        !Array.isArray(config.notifications)
+      ) {
+        const n = config.notifications as Record<string, unknown>
+        for (const key of ["done", "permission", "question", "error"] as const) {
+          const v = n[key]
+          if (v === undefined) continue
+          if (v === false) notifyOn[key] = false
+          else if (v === true) notifyOn[key] = true
+          else {
+            console.warn(
+              `[opencode-cmux] config.notifications.${key} ignored: expected boolean, got ${typeof v}`,
+            )
+          }
+        }
+      } else {
+        const got = Array.isArray(config.notifications)
+          ? "array"
+          : typeof config.notifications
+        console.warn(
+          `[opencode-cmux] config.notifications ignored: expected object, got ${got}`,
+        )
+      }
     }
   } catch {
     // File missing, unreadable, or invalid JSON — use defaults
@@ -233,7 +266,7 @@ const plugin: Plugin = async ({ client, $ }) => {
           const title = session?.title ?? sessionID
 
           if (!session?.parentID) {
-            await notify($, { title: `Done: ${title}` })
+            if (notifyOn.done) await notify($, { title: `Done: ${title}` })
             await log($, `Done: ${title}`, { level: "success", source: "opencode" })
             await clearStatus($, "opencode")
           } else {
@@ -257,7 +290,7 @@ const plugin: Plugin = async ({ client, $ }) => {
           ? (await fetchSession(sessionID))?.title ?? sessionID
           : "unknown session"
 
-        await notify($, { title: `Error: ${title}` })
+        if (notifyOn.error) await notify($, { title: `Error: ${title}` })
         await log($, `Error in session: ${title}`, {
           level: "error",
           source: "opencode",
@@ -277,7 +310,8 @@ const plugin: Plugin = async ({ client, $ }) => {
             icon: "lock",
             color: "#ef4444",
           })
-          await notify($, { title: "Needs your permission", subtitle: title })
+          if (notifyOn.permission)
+            await notify($, { title: "Needs your permission", subtitle: title })
           await log($, `Permission requested: ${title}`, {
             level: "info",
             source: "opencode",
@@ -312,7 +346,8 @@ const plugin: Plugin = async ({ client, $ }) => {
           icon: "help-circle",
           color: "#a855f7",
         })
-        await notify($, { title: "Has a question", subtitle: header })
+        if (notifyOn.question)
+          await notify($, { title: "Has a question", subtitle: header })
         await log($, `Question: ${header}`, { level: "info", source: "opencode" })
         return
       }
@@ -344,7 +379,8 @@ const plugin: Plugin = async ({ client, $ }) => {
         icon: "lock",
         color: "#ef4444",
       })
-      await notify($, { title: "Needs your permission", subtitle: title })
+      if (notifyOn.permission)
+        await notify($, { title: "Needs your permission", subtitle: title })
       await log($, `Permission requested: ${title}`, {
         level: "info",
         source: "opencode",
