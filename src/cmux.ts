@@ -3,6 +3,12 @@ import type { PluginInput } from "@opencode-ai/plugin"
 
 type Shell = PluginInput["$"]
 
+const CMUX = ((): string => {
+  const fromEnv = process.env.CMUX_BUNDLED_CLI_PATH
+  if (fromEnv && existsSync(fromEnv)) return fromEnv
+  return "cmux"
+})()
+
 export function isInCmux(): boolean {
   return (
     existsSync(process.env.CMUX_SOCKET_PATH ?? "/tmp/cmux.sock") ||
@@ -16,10 +22,12 @@ export async function notify(
 ): Promise<void> {
   if (!isInCmux()) return
   try {
-    const args: string[] = ["--title", opts.title]
-    if (opts.subtitle !== undefined) args.push("--subtitle", opts.subtitle)
-    if (opts.body !== undefined) args.push("--body", opts.body)
-    await $`cmux notify ${args}`.quiet().nothrow()
+    const bodyParts: string[] = []
+    if (opts.subtitle !== undefined) bodyParts.push(opts.subtitle)
+    if (opts.body !== undefined) bodyParts.push(opts.body)
+    const body = bodyParts.join(" — ")
+    const payload = JSON.stringify({ title: opts.title, body })
+    await $`${CMUX} rpc notification.create ${payload}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -36,7 +44,7 @@ export async function setStatus(
     const args: string[] = [key, text]
     if (opts?.icon !== undefined) args.push("--icon", opts.icon)
     if (opts?.color !== undefined) args.push("--color", opts.color)
-    await $`cmux set-status ${args}`.quiet().nothrow()
+    await $`${CMUX} set-status ${args}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -45,7 +53,7 @@ export async function setStatus(
 export async function clearStatus($: Shell, key: string): Promise<void> {
   if (!isInCmux()) return
   try {
-    await $`cmux clear-status ${key}`.quiet().nothrow()
+    await $`${CMUX} clear-status ${key}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -66,7 +74,7 @@ export async function log(
     }
     if (opts?.source !== undefined) args.push("--source", opts.source)
     args.push("--", message)
-    await $`cmux log ${args}`.quiet().nothrow()
+    await $`${CMUX} log ${args}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -88,7 +96,7 @@ export async function createSplit(
   try {
     const args: string[] = [direction]
     if (fromSurface) args.push("--surface", fromSurface)
-    const result = await $`cmux new-split ${args}`.quiet().nothrow()
+    const result = await $`${CMUX} new-split ${args}`.quiet().nothrow()
     const text = result.text().trim()
     if (!text) return null
     // Output format: "OK surface:<n> workspace:<n>"
@@ -105,7 +113,7 @@ export async function focusSurface(
 ): Promise<void> {
   if (!isInCmux()) return
   try {
-    await $`cmux focus-surface --surface ${surfaceId}`.quiet().nothrow()
+    await $`${CMUX} focus-surface --surface ${surfaceId}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -119,7 +127,7 @@ export async function sendToSurface(
   if (!isInCmux()) return
   try {
     const args = ["--surface", surfaceId, text]
-    await $`cmux send ${args}`.quiet().nothrow()
+    await $`${CMUX} send ${args}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -132,7 +140,7 @@ export async function sendKeyToSurface(
 ): Promise<void> {
   if (!isInCmux()) return
   try {
-    await $`cmux send-key --surface ${surfaceId} ${key}`.quiet().nothrow()
+    await $`${CMUX} send-key --surface ${surfaceId} ${key}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
@@ -144,7 +152,7 @@ export async function closeSurface(
 ): Promise<void> {
   if (!isInCmux()) return
   try {
-    await $`cmux close-surface --surface ${surfaceId}`.quiet().nothrow()
+    await $`${CMUX} close-surface --surface ${surfaceId}`.quiet().nothrow()
   } catch {
     // swallow errors silently
   }
