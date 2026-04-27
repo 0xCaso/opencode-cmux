@@ -16,16 +16,38 @@ export function isInCmux(): boolean {
   )
 }
 
+async function getPaneLabel($: Shell): Promise<string> {
+  const tmuxPane = process.env.TMUX_PANE
+  if (!tmuxPane) return ""
+  try {
+    const result =
+      await $`tmux display-message -p -t ${tmuxPane} -F '#{session_name}:#{window_index} #{pane_id}'`
+        .quiet()
+        .nothrow()
+    if (result.exitCode === 0) {
+      const text = result.stdout?.toString?.()?.trim?.()
+      if (text) return `[${text}]`
+    }
+  } catch {}
+  return `[${tmuxPane}]`
+}
+
 export async function notify(
   $: Shell,
   opts: { title: string; subtitle?: string; body?: string },
 ): Promise<void> {
   if (!isInCmux()) return
   try {
+    const prefix = await getPaneLabel($)
     const bodyParts: string[] = []
     if (opts.subtitle !== undefined) bodyParts.push(opts.subtitle)
     if (opts.body !== undefined) bodyParts.push(opts.body)
-    const body = bodyParts.join(" — ")
+    const baseBody = bodyParts.join(" — ")
+    const body = prefix
+      ? baseBody
+        ? `${prefix} ${baseBody}`
+        : prefix
+      : baseBody
     const payload = JSON.stringify({ title: opts.title, body })
     await $`${CMUX} rpc notification.create ${payload}`.quiet().nothrow()
   } catch {
