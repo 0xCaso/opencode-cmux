@@ -2,6 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
+import { join } from "node:path"
 import {
   notify,
   setStatus,
@@ -14,6 +15,8 @@ import {
   sendKeyToSurface,
   type SplitDirection,
 } from "./cmux.js"
+
+export const LSOF_LISTEN_RE = /:(\d+)\s+\(LISTEN\)/
 
 const plugin: Plugin = async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
@@ -30,7 +33,10 @@ const plugin: Plugin = async ({ client, $ }) => {
     error: true,
   }
   try {
-    const configPath = `${homedir()}/.config/opencode/opencode-cmux.json`
+    // Respect XDG_CONFIG_HOME, fall back to ~/.config per the XDG Base
+    // Directory Specification (https://specifications.freedesktop.org/basedir-spec/).
+    const configDir = process.env.XDG_CONFIG_HOME || join(homedir(), ".config")
+    const configPath = join(configDir, "opencode", "opencode-cmux.json")
     const raw = readFileSync(configPath, "utf-8")
     const config = JSON.parse(raw)
     if (config.splits === true) {
@@ -101,7 +107,7 @@ const plugin: Plugin = async ({ client, $ }) => {
         { encoding: "utf-8", timeout: 3000 },
       )
       for (const line of out.split("\n")) {
-        const match = line.match(/:(\d+)\s+\(LISTEN\)/)
+        const match = line.match(LSOF_LISTEN_RE)
         if (match) {
           discoveredServerUrl = `http://localhost:${match[1]}`
           return discoveredServerUrl
