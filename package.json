@@ -18,7 +18,8 @@
   "scripts": {
     "build": "tsc --emitDeclarationOnly && bun build src/index.ts --outdir dist --target node",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "bun run typecheck && bun run build"
+    "test": "bun test",
+    "prepublishOnly": "bun run typecheck && bun run test && bun run build"
   },
   "keywords": [
     "opencode",

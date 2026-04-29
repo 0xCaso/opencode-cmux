@@ -7,7 +7,7 @@ OpenCode plugin that bridges OpenCode events to cmux notifications and sidebar m
 ## Requirements
 
 - OpenCode ≥ 1.0
-- [cmux](https://cmux.app) (macOS app) installed with CLI accessible at `/usr/local/bin/cmux`
+- [cmux](https://cmux.app) (macOS app) installed; the plugin invokes `cmux` via `$CMUX_BUNDLED_CLI_PATH` (set by cmux's shell integration), falling back to `cmux` on `$PATH`
 - The plugin is a no-op when not running inside a cmux workspace
 
 ## Installation
@@ -38,15 +38,22 @@ Create `~/.config/opencode/opencode-cmux.json` to customize plugin behavior:
 
 ```json
 {
-  "splits": true
+  "splits": true,
+  "notifications": {
+    "done": false
+  }
 }
 ```
 
-| Option   | Type    | Default | Description                                              |
-|----------|---------|---------|----------------------------------------------------------|
-| `splits` | boolean | `false` | Open cmux split panes for subagent sessions              |
+| Option                     | Type    | Default | Description                                              |
+|----------------------------|---------|---------|----------------------------------------------------------|
+| `splits`                   | boolean | `false` | Open cmux split panes for subagent sessions              |
+| `notifications.done`       | boolean | `true`  | Show a popup when a session finishes                     |
+| `notifications.permission` | boolean | `true`  | Show a popup when OpenCode requests a permission         |
+| `notifications.question`   | boolean | `true`  | Show a popup when OpenCode asks a clarifying question    |
+| `notifications.error`      | boolean | `true`  | Show a popup when a session errors                       |
 
-If the file does not exist, all options use their defaults.
+If the file does not exist or any key is omitted, defaults are used. Each notification type can be toggled independently — useful when running multiple agents in parallel and per-turn `Done` popups become noisy.
 
 ## Subagent splits
 
@@ -71,7 +78,7 @@ Without `--port`, splits are silently skipped even when enabled.
 
 ## How it works
 
-The plugin responds to OpenCode lifecycle events by firing cmux CLI commands (`cmux notify`, `cmux set-status`, etc.). Each action targets the current cmux workspace, providing ambient awareness of what OpenCode is doing without requiring you to switch context. All commands are no-ops when cmux is not running.
+The plugin responds to OpenCode lifecycle events by firing cmux CLI commands (`cmux rpc notification.create`, `cmux set-status`, etc.). Each action targets the current cmux workspace, providing ambient awareness of what OpenCode is doing without requiring you to switch context. All commands are no-ops when cmux is not running.
 
 ## License
 
