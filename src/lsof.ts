@@ -1,0 +1,1 @@
+export const LSOF_LISTEN_RE = /:(\d+)\s+\(LISTEN\)/

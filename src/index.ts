@@ -3,6 +3,7 @@ import { execSync } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { LSOF_LISTEN_RE } from "./lsof.js"
 import {
   notify,
   setStatus,
@@ -15,8 +16,6 @@ import {
   sendKeyToSurface,
   type SplitDirection,
 } from "./cmux.js"
-
-export const LSOF_LISTEN_RE = /:(\d+)\s+\(LISTEN\)/
 
 const plugin: Plugin = async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test"
-import { LSOF_LISTEN_RE } from "../src/index"
+import { LSOF_LISTEN_RE } from "../src/lsof"
 
 test("LSOF_LISTEN_RE captures the port from a real lsof line", () => {
   const line =
