@@ -49,7 +49,7 @@ export async function notify(
         : prefix
       : baseBody
     const payload = JSON.stringify({ title: opts.title, body })
-    await $`${CMUX} rpc notification.create ${payload}`.quiet().nothrow()
+    await $`${CMUX} rpc notification.create ${payload} >/dev/null 2>&1`.nothrow()
   } catch {
     // swallow errors silently
   }
