@@ -69,12 +69,12 @@ Without `--port`, splits are silently skipped even when enabled.
 
 | Event | cmux action |
 |---|---|
-| Session starts working | Sidebar status: "working" (amber, terminal icon) |
-| Session completes (primary) | Desktop notification + log + clear status |
+| Session starts working | Sidebar status: "Running" (blue, `bolt.fill` icon) |
+| Session completes (primary) | Desktop notification with the final response summary + log + persistent "Idle" status (gray, `pause.circle.fill` icon) |
 | Session completes (subagent) | Log only (no notification spam) |
 | Session error | Desktop notification + log + clear status |
-| Permission requested | Desktop notification + sidebar status: "waiting" (red, lock icon) |
-| AI has a question (`ask` tool) | Desktop notification + sidebar status: "question" (purple) |
+| Permission requested | Desktop notification + sidebar status: "Needs input" (blue, `bell.fill` icon) |
+| AI has a question (`ask` tool) | Desktop notification + sidebar status: "Needs input" (blue, `bell.fill` icon) |
 
 ## How it works
 
