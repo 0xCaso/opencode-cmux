@@ -17,9 +17,24 @@ import {
   type SplitDirection,
 } from "./cmux.js"
 
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+function addBounded(set: Set<string>, value: string): void {
+  set.add(value)
+  if (set.size > 300) {
+    const oldest = set.values().next().value
+    if (oldest !== undefined) set.delete(oldest)
+  }
+}
+
 const plugin: Plugin = async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
+  const messageRoles = new Map<string, { sessionID: string; role: string }>()
+  const assistantResponses = new Map<string, { messageID: string; parts: Map<string, string> }>()
+  const erroredSessions = new Set<string>()
+  const suppressedIdleAfterError = new Set<string>()
+  const runningSessions = new Set<string>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
@@ -156,6 +171,77 @@ const plugin: Plugin = async ({ client, $ }) => {
     return pendingPermissions.size > 0 || pendingQuestions.size > 0
   }
 
+  function normalizeText(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined
+    const normalized = value.replace(/\s+/g, " ").trim()
+    return normalized || undefined
+  }
+
+  function getAssistantSummary(sessionID: string): string | undefined {
+    const response = assistantResponses.get(sessionID)
+    if (!response) return undefined
+
+    const joined = [...response.parts.values()].filter(Boolean).join(" ")
+    if (!joined) return undefined
+    const characters = Array.from(graphemeSegmenter.segment(joined), ({ segment }) => segment)
+    return characters.length > 200 ? `${characters.slice(0, 199).join("")}…` : joined
+  }
+
+  function clearAssistantResponse(sessionID: string): void {
+    assistantResponses.delete(sessionID)
+  }
+
+  function trackMessage(e: any): void {
+    if (e.type === "message.updated") {
+      const info = e.properties?.info ?? e.properties?.message ?? {}
+      const messageID = info.id ?? e.properties?.messageID
+      const sessionID = info.sessionID ?? e.properties?.sessionID
+      const role = info.role ?? e.properties?.role
+
+      if (
+        typeof messageID === "string" &&
+        typeof sessionID === "string" &&
+        typeof role === "string"
+      ) {
+        messageRoles.set(messageID, { sessionID, role })
+        if (messageRoles.size > 300) {
+          const oldestMessageID = messageRoles.keys().next().value
+          if (oldestMessageID !== undefined) messageRoles.delete(oldestMessageID)
+        }
+
+        if (role === "assistant") {
+          const response = assistantResponses.get(sessionID)
+          if (!response || response.messageID !== messageID) {
+            assistantResponses.set(sessionID, { messageID, parts: new Map() })
+            if (assistantResponses.size > 300) {
+              const oldestSessionID = assistantResponses.keys().next().value
+              if (oldestSessionID !== undefined) assistantResponses.delete(oldestSessionID)
+            }
+          }
+        }
+      }
+      return
+    }
+
+    if (e.type !== "message.part.updated") return
+
+    const part = e.properties?.part
+    if (
+      part?.type !== "text" ||
+      typeof part.messageID !== "string" ||
+      typeof part.id !== "string"
+    )
+      return
+
+    const message = messageRoles.get(part.messageID)
+    if (message?.role !== "assistant") return
+
+    const response = assistantResponses.get(message.sessionID)
+    if (!response || response.messageID !== part.messageID) return
+
+    response.parts.set(part.id, normalizeText(part.text || part.textDelta || part.content) ?? "")
+  }
+
   function getPermissionRequestID(source: any): string | undefined {
     if (!source) return undefined
     const rawID = source.id ?? source.requestID ?? source.permissionID
@@ -189,6 +275,11 @@ const plugin: Plugin = async ({ client, $ }) => {
   return {
     async event({ event }) {
       const e = event as any
+
+      if (e.type === "message.updated" || e.type === "message.part.updated") {
+        trackMessage(e)
+        return
+      }
 
       if (e.type === "session.created") {
         const info = e.properties.info
@@ -245,24 +336,53 @@ const plugin: Plugin = async ({ client, $ }) => {
 
       if (e.type === "session.deleted") {
         const info = e.properties.info
-        if (info?.id) removeAndClose(info.id)
+        if (info?.id) {
+          clearAssistantResponse(info.id)
+          erroredSessions.delete(info.id)
+          suppressedIdleAfterError.delete(info.id)
+          runningSessions.delete(info.id)
+          removeAndClose(info.id)
+        }
         return
       }
 
       if (e.type === "session.status") {
         const { sessionID, status } = e.properties
 
-        if (status.type === "busy") {
+        if (status.type === "busy" || status.type === "retry") {
+          erroredSessions.delete(sessionID)
+          suppressedIdleAfterError.delete(sessionID)
+          if (!runningSessions.has(sessionID)) {
+            runningSessions.add(sessionID)
+            clearAssistantResponse(sessionID)
+          }
           if (!isWaitingForInput()) {
-            await setStatus($, "opencode", "working", {
-              icon: "terminal",
-              color: "#f59e0b",
+            await setStatus($, "opencode", "Running", {
+              icon: "bolt.fill",
+              color: "#4C8DFF",
             })
           }
           return
         }
 
         if (status.type === "idle") {
+          runningSessions.delete(sessionID)
+          if (erroredSessions.has(sessionID)) {
+            erroredSessions.delete(sessionID)
+            addBounded(suppressedIdleAfterError, sessionID)
+            clearAssistantResponse(sessionID)
+            await setStatus($, "opencode", "Idle", {
+              icon: "pause.circle.fill",
+              color: "#8E8E93",
+            })
+            return
+          }
+
+          if (suppressedIdleAfterError.has(sessionID)) {
+            clearAssistantResponse(sessionID)
+            return
+          }
+
           if (isWaitingForInput()) {
             return
           }
@@ -271,9 +391,17 @@ const plugin: Plugin = async ({ client, $ }) => {
           const title = session?.title ?? sessionID
 
           if (!session?.parentID) {
-            if (notifyOn.done) await notify($, { title: `Done: ${title}` })
+            if (notifyOn.done) {
+              await notify($, {
+                title: `Done: ${title}`,
+                body: getAssistantSummary(sessionID),
+              })
+            }
             await log($, `Done: ${title}`, { level: "success", source: "opencode" })
-            await clearStatus($, "opencode")
+            await setStatus($, "opencode", "Idle", {
+              icon: "pause.circle.fill",
+              color: "#8E8E93",
+            })
           } else {
             await log($, `Subagent finished: ${title}`, {
               level: "info",
@@ -282,6 +410,7 @@ const plugin: Plugin = async ({ client, $ }) => {
 
             removeAndClose(sessionID)
           }
+          clearAssistantResponse(sessionID)
           return
         }
       }
@@ -291,6 +420,11 @@ const plugin: Plugin = async ({ client, $ }) => {
         pendingQuestions.clear()
 
         const sessionID = e.properties.sessionID
+        if (sessionID) {
+          runningSessions.delete(sessionID)
+          addBounded(erroredSessions, sessionID)
+          clearAssistantResponse(sessionID)
+        }
         const title = sessionID
           ? (await fetchSession(sessionID))?.title ?? sessionID
           : "unknown session"
@@ -311,9 +445,9 @@ const plugin: Plugin = async ({ client, $ }) => {
         if (id && !pendingPermissions.has(id)) {
           pendingPermissions.add(id)
           const title = e.properties.title ?? e.properties.permission ?? "command"
-          await setStatus($, "opencode", "waiting", {
-            icon: "lock",
-            color: "#ef4444",
+          await setStatus($, "opencode", "Needs input", {
+            icon: "bell.fill",
+            color: "#4C8DFF",
           })
           if (notifyOn.permission)
             await notify($, { title: "Needs your permission", subtitle: title })
@@ -332,9 +466,9 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         if (!isWaitingForInput()) {
-          await setStatus($, "opencode", "working", {
-            icon: "terminal",
-            color: "#f59e0b",
+          await setStatus($, "opencode", "Running", {
+            icon: "bolt.fill",
+            color: "#4C8DFF",
           })
         }
         return
@@ -347,9 +481,9 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         const header = e.properties.questions?.[0]?.header ?? "Question"
-        await setStatus($, "opencode", "question", {
-          icon: "help-circle",
-          color: "#a855f7",
+        await setStatus($, "opencode", "Needs input", {
+          icon: "bell.fill",
+          color: "#4C8DFF",
         })
         if (notifyOn.question)
           await notify($, { title: "Has a question", subtitle: header })
@@ -364,9 +498,9 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         if (!isWaitingForInput()) {
-          await setStatus($, "opencode", "working", {
-            icon: "terminal",
-            color: "#f59e0b",
+          await setStatus($, "opencode", "Running", {
+            icon: "bolt.fill",
+            color: "#4C8DFF",
           })
         }
         return
@@ -380,9 +514,9 @@ const plugin: Plugin = async ({ client, $ }) => {
       }
 
       const title = (input as any).title ?? (input as any).permission ?? "command"
-      await setStatus($, "opencode", "waiting", {
-        icon: "lock",
-        color: "#ef4444",
+      await setStatus($, "opencode", "Needs input", {
+        icon: "bell.fill",
+        color: "#4C8DFF",
       })
       if (notifyOn.permission)
         await notify($, { title: "Needs your permission", subtitle: title })
