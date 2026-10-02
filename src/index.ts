@@ -17,6 +17,9 @@ import {
   type SplitDirection,
 } from "./cmux.js"
 
+// v1 calls server(); v2 calls setup() and never the function itself.
+// v1 (OpenCode >=1.18.29) loads a default object with server(); older v1
+// loads a default function. One file cannot satisfy both loaders.
 const plugin: Plugin = async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
@@ -394,4 +397,75 @@ const plugin: Plugin = async ({ client, $ }) => {
   }
 }
 
-export default plugin
+// Bun's `$` returns a thenable with .quiet().nothrow(), .text(), .stdout and
+// .exitCode. The published build targets node, so v2 cannot import bun.
+function shell(): any {
+  const run = (strings: TemplateStringsArray, ...values: any[]) => {
+    const command = strings.reduce((acc, part, i) => acc + part + (i < values.length ? String(values[i]) : ""), "")
+    const done = import("node:child_process").then(
+      ({ execFile }) =>
+        new Promise<{ stdout: string; exitCode: number }>((resolve) => {
+          execFile("sh", ["-c", command], { encoding: "utf8" }, (error, stdout) => {
+            resolve({ stdout: stdout ?? "", exitCode: error ? 1 : 0 })
+          })
+        }),
+    )
+    const out: any = {
+      quiet: () => out,
+      nothrow: () => out,
+      then: (onFulfilled: any, onRejected: any) =>
+        done.then(
+          (result) =>
+            onFulfilled({
+              stdout: result.stdout,
+              exitCode: result.exitCode,
+              text: () => result.stdout,
+            }),
+          onRejected,
+        ),
+      text: () => done.then((result) => result.stdout),
+    }
+    return out
+  }
+  return run
+}
+
+// v2's client is grouped by domain and returns values directly. The plugin body
+// still calls the v1 SDK (client.session.get -> { data }).
+function v1Client(session: any): any {
+  return {
+    session: {
+      get: async (args: any) => ({ data: await session.get(args) }),
+    },
+  }
+}
+
+// v1 events are { type, properties }. v2 events are { type, data }.
+function toV1Event(event: any) {
+  if (typeof event?.type !== "string") return
+  const body = event.properties ?? event.data
+  if (!body || typeof body !== "object") return
+  return { type: event.type, properties: body }
+}
+
+export default {
+  id: "opencode-cmux",
+  server: plugin,
+  async setup(ctx: any) {
+    const hooks = await plugin({ client: v1Client(ctx.session), $: shell() } as any)
+
+    await ctx.session.hook("evaluate", async (input: any) => {
+      await hooks["permission.ask"]?.(input, undefined as any)
+    })
+
+    const controller = new AbortController()
+    void (async () => {
+      for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
+        const event = toV1Event(raw)
+        if (!event || !hooks.event) continue
+        await hooks.event({ event } as any).catch(() => undefined)
+      }
+    })()
+    return () => controller.abort()
+  },
+}
