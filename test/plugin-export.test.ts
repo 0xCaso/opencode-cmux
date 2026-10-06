@@ -1,5 +1,4 @@
 import { test, expect } from "bun:test"
-import { existsSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import plugin from "../src/index"
 import * as pluginModule from "../src/index"
@@ -7,11 +6,10 @@ import * as pluginModule from "../src/index"
 async function loadBuiltPluginModule() {
   const builtPluginPath = new URL("../dist/index.js", import.meta.url)
 
-  if (!existsSync(builtPluginPath)) {
-    execFileSync("bun", ["run", "build"], { stdio: "inherit" })
-  }
+  // Always rebuild: a stale dist/ would test old code.
+  execFileSync("bun", ["run", "build"], { stdio: "ignore" })
 
-  return import("../dist/index.js")
+  return import(builtPluginPath.href)
 }
 
 test("default export is a v1 server() and a v2 setup()", () => {
