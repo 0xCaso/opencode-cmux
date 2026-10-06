@@ -6,7 +6,7 @@ OpenCode plugin that bridges OpenCode events to cmux notifications and sidebar m
 
 ## Requirements
 
-- OpenCode ≥ 1.0
+- OpenCode ≥ 1.0, including OpenCode 2 (`@opencode/cli`)
 - [cmux](https://cmux.app) (macOS app) installed; the plugin invokes `cmux` via `$CMUX_BUNDLED_CLI_PATH` (set by cmux's shell integration), falling back to `cmux` on `$PATH`
 - The plugin is a no-op when not running inside a cmux workspace
 
@@ -65,6 +65,12 @@ opencode --port 0  # binds to first available port
 
 Without `--port`, splits are silently skipped even when enabled.
 
+OpenCode 2 has no `opencode attach` and every server asks for a password. The split runs `opencode --server <url> --session <id>`, so it works only when `OPENCODE_SERVER_PASSWORD` is exported in your shell profile, where both OpenCode and the new pane can read it. Without it, splits are skipped.
+
+## OpenCode 2 background service
+
+By default OpenCode 2 runs sessions in one shared background service, and plugins run inside it. The service keeps the cmux variables of the tab that started it, so notifications from other tabs open that first tab. Start OpenCode with `--standalone` to give each tab its own server and the right notification target.
+
 ## What it does
 
 | Event | cmux action |
@@ -72,9 +78,10 @@ Without `--port`, splits are silently skipped even when enabled.
 | Session starts working | Sidebar status: "working" (amber, terminal icon) |
 | Session completes (primary) | Desktop notification + log + clear status |
 | Session completes (subagent) | Log only (no notification spam) |
-| Session error | Desktop notification + log + clear status |
+| Session error | Desktop notification with the error message + log + clear status |
+| Session interrupted (Esc) | Clear status (no notification) |
 | Permission requested | Desktop notification + sidebar status: "waiting" (red, lock icon) |
-| AI has a question (`ask` tool) | Desktop notification + sidebar status: "question" (purple) |
+| AI has a question (`question` tool) | Desktop notification + sidebar status: "question" (purple) |
 
 ## How it works
 

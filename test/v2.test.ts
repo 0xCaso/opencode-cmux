@@ -1,8 +1,8 @@
 import { test, expect } from "bun:test"
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { shell, toV1Event, v1Client } from "../src/v2"
+import { attachCommand, shell, toV1Event, v1Client } from "../src/v2"
 
 // Payloads below are copied from events captured on OpenCode 2.0.24.
 const sessionID = "ses_eef536077ffe3wRmuATt2MFiqA"
@@ -12,12 +12,16 @@ test("execution events become v1 session.status / session.error", () => {
     type: "session.status",
     properties: { sessionID, status: { type: "busy" } },
   })
-  for (const type of ["session.execution.succeeded", "session.execution.interrupted"]) {
-    expect(toV1Event({ type, data: { sessionID, reason: "user" } })).toEqual({
-      type: "session.status",
-      properties: { sessionID, status: { type: "idle" } },
-    })
-  }
+  expect(toV1Event({ type: "session.execution.succeeded", data: { sessionID } })).toEqual({
+    type: "session.status",
+    properties: { sessionID, status: { type: "idle" } },
+  })
+  expect(
+    toV1Event({ type: "session.execution.interrupted", data: { sessionID, reason: "user" } }),
+  ).toEqual({
+    type: "session.error",
+    properties: { sessionID, error: { name: "MessageAbortedError" } },
+  })
   expect(
     toV1Event({ type: "session.execution.failed", data: { sessionID, error: { type: "x" } } }),
   ).toEqual({ type: "session.error", properties: { sessionID, error: { type: "x" } } })
@@ -66,7 +70,7 @@ test("permission events keep the request id", () => {
       id: "per_110acabda0010YPWu8M5kABYVd",
       sessionID,
       permission: "shell",
-      title: "shell: echo hi > /tmp/oc-proj/x.txt",
+      patterns: ["echo hi > /tmp/oc-proj/x.txt"],
     },
   })
   const replied = { sessionID, requestID: "per_110acabda0010YPWu8M5kABYVd", reply: "reject" }
@@ -129,7 +133,23 @@ test("shell passes each interpolated value as one escaped argument", async () =>
   )
 })
 
-test("setup drives cmux from v2 events", () => {
+test("splits join a v2 server only when its password is exported", () => {
+  const saved = process.env.OPENCODE_SERVER_PASSWORD
+  try {
+    delete process.env.OPENCODE_SERVER_PASSWORD
+    expect(attachCommand("http://localhost:4096", sessionID)).toBeNull()
+    process.env.OPENCODE_SERVER_PASSWORD = "secret"
+    expect(attachCommand("http://localhost:4096", sessionID)).toBe(
+      `opencode --server http://localhost:4096 --session ${sessionID}`,
+    )
+  } finally {
+    if (saved === undefined) delete process.env.OPENCODE_SERVER_PASSWORD
+    else process.env.OPENCODE_SERVER_PASSWORD = saved
+  }
+})
+
+// Runs a fixture against a fake cmux and returns the path of its call log.
+function runFixture(name: string) {
   const dir = mkdtempSync(join(tmpdir(), "opencode-cmux-v2-"))
   const fakeCmux = join(dir, "cmux")
   const callLog = join(dir, "calls.jsonl")
@@ -139,7 +159,7 @@ test("setup drives cmux from v2 events", () => {
   )
   chmodSync(fakeCmux, 0o755)
 
-  const result = Bun.spawnSync(["bun", join(import.meta.dir, "fixtures", "v2-setup.ts")], {
+  const result = Bun.spawnSync(["bun", join(import.meta.dir, "fixtures", name)], {
     env: {
       ...process.env,
       CMUX_BUNDLED_CLI_PATH: fakeCmux,
@@ -151,8 +171,15 @@ test("setup drives cmux from v2 events", () => {
   })
   expect(result.stderr.toString()).toBe("")
   expect(result.exitCode).toBe(0)
+  return callLog
+}
 
-  const calls = readFileSync(callLog, "utf8")
+test("setup stays quiet when OpenCode 1.18 also started server()", () => {
+  expect(existsSync(runFixture("server-and-setup.ts"))).toBe(false)
+})
+
+test("setup drives cmux from v2 events", () => {
+  const calls = readFileSync(runFixture("v2-setup.ts"), "utf8")
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line))

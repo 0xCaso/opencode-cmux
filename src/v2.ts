@@ -15,6 +15,14 @@ export function shell(): any {
   return () => out
 }
 
+// v2 has no `opencode attach`: the TUI joins a server with --server. Every v2
+// server asks for a password, which the plugin can only know when the user
+// exports OPENCODE_SERVER_PASSWORD (the new pane then inherits it too).
+export function attachCommand(url: string, sessionID: string): string | null {
+  if (!process.env.OPENCODE_SERVER_PASSWORD) return null
+  return `opencode --server ${url} --session ${sessionID}`
+}
+
 // v2's session.get takes { sessionID } and returns the session directly.
 // The plugin body still calls the v1 SDK shape.
 export function v1Client(session: any): any {
@@ -39,8 +47,14 @@ export function toV1Event(event: any): { type: string; properties: any } | undef
     case "session.execution.started":
       return { type: "session.status", properties: { sessionID, status: { type: "busy" } } }
     case "session.execution.succeeded":
-    case "session.execution.interrupted":
       return { type: "session.status", properties: { sessionID, status: { type: "idle" } } }
+    // Esc, a rejected permission or a dismissed question. v1 reports these
+    // as an aborted error.
+    case "session.execution.interrupted":
+      return {
+        type: "session.error",
+        properties: { sessionID, error: { name: "MessageAbortedError" } },
+      }
     case "session.execution.failed":
       return { type: "session.error", properties: { sessionID, error: data.error } }
     case "session.created":
@@ -50,18 +64,16 @@ export function toV1Event(event: any): { type: string; properties: any } | undef
       }
     case "session.deleted":
       return { type: "session.deleted", properties: { info: { id: sessionID } } }
-    case "permission.asked": {
-      const resources = Array.isArray(data.resources) ? data.resources.join(", ") : ""
+    case "permission.asked":
       return {
         type: "permission.asked",
         properties: {
           id: data.id,
           sessionID,
           permission: data.action,
-          title: resources ? `${data.action}: ${resources}` : data.action,
+          patterns: Array.isArray(data.resources) ? data.resources : [],
         },
       }
-    }
     case "permission.replied":
       return { type: "permission.replied", properties: data }
     // v2 asks the user questions through forms.
