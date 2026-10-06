@@ -76,6 +76,35 @@ test("permission events keep the request id", () => {
   })
 })
 
+test("question forms become v1 question events", () => {
+  const formID = "frm_110e45fab00124NcjZ3Go06MSX"
+  expect(
+    toV1Event({
+      type: "form.created",
+      data: {
+        form: {
+          id: formID,
+          sessionID,
+          title: "Questions",
+          metadata: { kind: "question" },
+          fields: [{ key: "q0", title: "Colore", description: "Preferisci rosso o blu?" }],
+        },
+      },
+    }),
+  ).toEqual({
+    type: "question.asked",
+    properties: { id: formID, sessionID, questions: [{ header: "Colore" }] },
+  })
+  expect(toV1Event({ type: "form.replied", data: { id: formID, sessionID } })).toEqual({
+    type: "question.replied",
+    properties: { id: formID, sessionID },
+  })
+  expect(toV1Event({ type: "form.cancelled", data: { id: formID, sessionID } })).toEqual({
+    type: "question.rejected",
+    properties: { id: formID, sessionID },
+  })
+})
+
 test("v1Client.session.get calls v2 with { sessionID }", async () => {
   const calls: unknown[] = []
   const client = v1Client({

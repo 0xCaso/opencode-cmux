@@ -64,5 +64,19 @@ export function toV1Event(event: any): { type: string; properties: any } | undef
     }
     case "permission.replied":
       return { type: "permission.replied", properties: data }
+    // v2 asks the user questions through forms.
+    case "form.created": {
+      const form = data.form
+      if (!form?.id) return
+      const header = form.fields?.[0]?.title ?? form.title
+      return {
+        type: "question.asked",
+        properties: { id: form.id, sessionID: form.sessionID, questions: [{ header }] },
+      }
+    }
+    case "form.replied":
+      return { type: "question.replied", properties: { id: data.id, sessionID } }
+    case "form.cancelled":
+      return { type: "question.rejected", properties: { id: data.id, sessionID } }
   }
 }
