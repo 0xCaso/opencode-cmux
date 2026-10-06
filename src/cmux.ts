@@ -48,7 +48,14 @@ export async function notify(
         ? `${prefix} ${baseBody}`
         : prefix
       : baseBody
-    const payload = JSON.stringify({ title: opts.title, body })
+    // Without a target cmux attaches the notification to whatever tab is
+    // focused when it fires, so clicking it opens the wrong tab.
+    const payload = JSON.stringify({
+      title: opts.title,
+      body,
+      workspace_id: process.env.CMUX_WORKSPACE_ID || undefined,
+      surface_id: process.env.CMUX_SURFACE_ID || undefined,
+    })
     await $`${CMUX} rpc notification.create ${payload}`.quiet().nothrow()
   } catch {
     // swallow errors silently

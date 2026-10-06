@@ -4,10 +4,10 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { LSOF_LISTEN_RE } from "./lsof.js"
+import { attachCommand, shell, toV1Event, v1Client } from "./v2.js"
 import {
   notify,
   setStatus,
-  clearStatus,
   log,
   createSplit,
   closeSurface,
@@ -17,24 +17,32 @@ import {
   type SplitDirection,
 } from "./cmux.js"
 
-const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+type AttachCommand = (url: string, sessionID: string) => string | null
 
-function addBounded(set: Set<string>, value: string): void {
-  set.add(value)
-  if (set.size > 300) {
-    const oldest = set.values().next().value
-    if (oldest !== undefined) set.delete(oldest)
-  }
+// The states cmux shows for its own Claude Code and Codex integrations (0.65).
+const RUNNING = { icon: "bolt.fill", color: "#4C8DFF" }
+const IDLE = { icon: "pause.circle.fill", color: "#8E8E93" }
+const NEEDS_INPUT = { icon: "bell.fill", color: "#4C8DFF" }
+
+const SUMMARY_LENGTH = 200
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+// Keeps per-message maps from growing for the whole life of the server.
+function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key)
+  map.set(key, value)
+  if (map.size > 300) map.delete(map.keys().next().value as K)
 }
 
-const plugin: Plugin = async ({ client, $ }) => {
+const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
-  const messageRoles = new Map<string, { sessionID: string; role: string }>()
-  const assistantResponses = new Map<string, { messageID: string; parts: Map<string, string> }>()
-  const erroredSessions = new Set<string>()
-  const suppressedIdleAfterError = new Set<string>()
-  const runningSessions = new Set<string>()
+  // Sessions whose turn ended in an error or abort. OpenCode still sends idle
+  // afterwards (1.18 sends it twice), which must not become a Done.
+  const failedSessions = new Set<string>()
+  // The latest assistant message of each session, shown in the Done popup.
+  const assistantMessages = new Map<string, string>()
+  const responses = new Map<string, { messageID: string; parts: Map<string, string> }>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
@@ -171,75 +179,40 @@ const plugin: Plugin = async ({ client, $ }) => {
     return pendingPermissions.size > 0 || pendingQuestions.size > 0
   }
 
-  function normalizeText(value: unknown): string | undefined {
-    if (typeof value !== "string") return undefined
-    const normalized = value.replace(/\s+/g, " ").trim()
-    return normalized || undefined
-  }
-
-  function getAssistantSummary(sessionID: string): string | undefined {
-    const response = assistantResponses.get(sessionID)
-    if (!response) return undefined
-
-    const joined = [...response.parts.values()].filter(Boolean).join(" ")
-    if (!joined) return undefined
-    const characters = Array.from(graphemeSegmenter.segment(joined), ({ segment }) => segment)
-    return characters.length > 200 ? `${characters.slice(0, 199).join("")}…` : joined
-  }
-
-  function clearAssistantResponse(sessionID: string): void {
-    assistantResponses.delete(sessionID)
-  }
+  const showRunning = () => setStatus($, "opencode", "Running", RUNNING)
+  const showIdle = () => setStatus($, "opencode", "Idle", IDLE)
+  const showNeedsInput = () => setStatus($, "opencode", "Needs input", NEEDS_INPUT)
 
   function trackMessage(e: any): void {
     if (e.type === "message.updated") {
-      const info = e.properties?.info ?? e.properties?.message ?? {}
-      const messageID = info.id ?? e.properties?.messageID
-      const sessionID = info.sessionID ?? e.properties?.sessionID
-      const role = info.role ?? e.properties?.role
-
-      if (
-        typeof messageID === "string" &&
-        typeof sessionID === "string" &&
-        typeof role === "string"
-      ) {
-        messageRoles.set(messageID, { sessionID, role })
-        if (messageRoles.size > 300) {
-          const oldestMessageID = messageRoles.keys().next().value
-          if (oldestMessageID !== undefined) messageRoles.delete(oldestMessageID)
-        }
-
-        if (role === "assistant") {
-          const response = assistantResponses.get(sessionID)
-          if (!response || response.messageID !== messageID) {
-            assistantResponses.set(sessionID, { messageID, parts: new Map() })
-            if (assistantResponses.size > 300) {
-              const oldestSessionID = assistantResponses.keys().next().value
-              if (oldestSessionID !== undefined) assistantResponses.delete(oldestSessionID)
-            }
-          }
-        }
-      }
+      const info = e.properties?.info
+      if (info?.role !== "assistant" || typeof info.id !== "string") return
+      if (typeof info.sessionID !== "string") return
+      remember(assistantMessages, info.id, info.sessionID)
+      if (responses.get(info.sessionID)?.messageID !== info.id)
+        remember(responses, info.sessionID, { messageID: info.id, parts: new Map() })
       return
     }
 
-    if (e.type !== "message.part.updated") return
-
     const part = e.properties?.part
-    if (
-      part?.type !== "text" ||
-      typeof part.messageID !== "string" ||
-      typeof part.id !== "string"
-    )
-      return
-
-    const message = messageRoles.get(part.messageID)
-    if (message?.role !== "assistant") return
-
-    const response = assistantResponses.get(message.sessionID)
+    if (part?.type !== "text" || typeof part.id !== "string") return
+    const sessionID = assistantMessages.get(part.messageID)
+    const response = sessionID ? responses.get(sessionID) : undefined
     if (!response || response.messageID !== part.messageID) return
+    const text = typeof part.text === "string" ? part.text.replace(/\s+/g, " ").trim() : ""
+    response.parts.set(part.id, text)
+  }
 
-    response.parts.set(part.id, normalizeText(part.text || part.textDelta || part.content) ?? "")
+  // Takes the summary out, so a later turn never shows a stale response.
+  function takeSummary(sessionID: string): string | undefined {
+    const response = responses.get(sessionID)
+    responses.delete(sessionID)
+    const text = response ? [...response.parts.values()].filter(Boolean).join(" ") : ""
+    if (!text) return undefined
+    const chars = Array.from(graphemes.segment(text), ({ segment }) => segment)
+    return chars.length > SUMMARY_LENGTH
+      ? `${chars.slice(0, SUMMARY_LENGTH - 1).join("")}…`
+      : text
   }
 
   function getPermissionRequestID(source: any): string | undefined {
@@ -248,6 +221,14 @@ const plugin: Plugin = async ({ client, $ }) => {
     if (typeof rawID !== "string") return undefined
     const trimmed = rawID.trim()
     return trimmed === "" ? undefined : trimmed
+  }
+
+  // OpenCode 1.18 sends the command as `patterns` with no `title`.
+  function getPermissionTitle(source: any): string {
+    if (typeof source?.title === "string" && source.title.trim() !== "") return source.title
+    const name = source?.permission ?? source?.type ?? "command"
+    const patterns = Array.isArray(source?.patterns) ? source.patterns : []
+    return patterns.length > 0 ? `${name}: ${patterns.join(", ")}` : name
   }
 
   function getQuestionRequestID(source: any): string | undefined {
@@ -285,7 +266,8 @@ const plugin: Plugin = async ({ client, $ }) => {
         const info = e.properties.info
         if (splitsEnabled && info?.parentID) {
           const url = resolveServerUrl()
-          if (url) {
+          const command = url ? attachCommand(url, info.id) : null
+          if (command) {
             await enqueueSplitOp(async () => {
               if (activeSplits.has(info.id)) return
 
@@ -321,8 +303,7 @@ const plugin: Plugin = async ({ client, $ }) => {
               activeSplits.set(info.id, surfaceId)
               agentCount++
 
-              const attachCmd = `opencode attach ${url} --session ${info.id}`
-              await sendToSurface($, surfaceId, attachCmd)
+              await sendToSurface($, surfaceId, command)
               await sendKeyToSurface($, surfaceId, "enter")
 
               if (originalSurfaceId) {
@@ -337,10 +318,8 @@ const plugin: Plugin = async ({ client, $ }) => {
       if (e.type === "session.deleted") {
         const info = e.properties.info
         if (info?.id) {
-          clearAssistantResponse(info.id)
-          erroredSessions.delete(info.id)
-          suppressedIdleAfterError.delete(info.id)
-          runningSessions.delete(info.id)
+          failedSessions.delete(info.id)
+          responses.delete(info.id)
           removeAndClose(info.id)
         }
         return
@@ -350,58 +329,29 @@ const plugin: Plugin = async ({ client, $ }) => {
         const { sessionID, status } = e.properties
 
         if (status.type === "busy" || status.type === "retry") {
-          erroredSessions.delete(sessionID)
-          suppressedIdleAfterError.delete(sessionID)
-          if (!runningSessions.has(sessionID)) {
-            runningSessions.add(sessionID)
-            clearAssistantResponse(sessionID)
-          }
-          if (!isWaitingForInput()) {
-            await setStatus($, "opencode", "Running", {
-              icon: "bolt.fill",
-              color: "#4C8DFF",
-            })
-          }
+          failedSessions.delete(sessionID)
+          if (!isWaitingForInput()) await showRunning()
           return
         }
 
         if (status.type === "idle") {
-          runningSessions.delete(sessionID)
-          if (erroredSessions.has(sessionID)) {
-            erroredSessions.delete(sessionID)
-            addBounded(suppressedIdleAfterError, sessionID)
-            clearAssistantResponse(sessionID)
-            await setStatus($, "opencode", "Idle", {
-              icon: "pause.circle.fill",
-              color: "#8E8E93",
-            })
-            return
-          }
-
-          if (suppressedIdleAfterError.has(sessionID)) {
-            clearAssistantResponse(sessionID)
-            return
-          }
-
-          if (isWaitingForInput()) {
+          if (failedSessions.has(sessionID) || isWaitingForInput()) {
             return
           }
 
           const session = await fetchSession(sessionID)
-          const title = session?.title ?? sessionID
+          const title = session?.title || sessionID
+
+          const summary = takeSummary(sessionID)
 
           if (!session?.parentID) {
-            if (notifyOn.done) {
+            if (notifyOn.done)
               await notify($, {
-                title: `Done: ${title}`,
-                body: getAssistantSummary(sessionID),
+                title: session?.title ? `Done: ${title}` : "Done",
+                body: summary,
               })
-            }
             await log($, `Done: ${title}`, { level: "success", source: "opencode" })
-            await setStatus($, "opencode", "Idle", {
-              icon: "pause.circle.fill",
-              color: "#8E8E93",
-            })
+            await showIdle()
           } else {
             await log($, `Subagent finished: ${title}`, {
               level: "info",
@@ -410,7 +360,6 @@ const plugin: Plugin = async ({ client, $ }) => {
 
             removeAndClose(sessionID)
           }
-          clearAssistantResponse(sessionID)
           return
         }
       }
@@ -421,20 +370,33 @@ const plugin: Plugin = async ({ client, $ }) => {
 
         const sessionID = e.properties.sessionID
         if (sessionID) {
-          runningSessions.delete(sessionID)
-          addBounded(erroredSessions, sessionID)
-          clearAssistantResponse(sessionID)
+          failedSessions.add(sessionID)
+          responses.delete(sessionID)
         }
-        const title = sessionID
-          ? (await fetchSession(sessionID))?.title ?? sessionID
-          : "unknown session"
 
-        if (notifyOn.error) await notify($, { title: `Error: ${title}` })
-        await log($, `Error in session: ${title}`, {
+        // Esc in the TUI: the user is at the terminal, so no popup.
+        const error = e.properties.error
+        if (error?.name === "MessageAbortedError") {
+          await showIdle()
+          if (sessionID) removeAndClose(sessionID)
+          return
+        }
+
+        const sessionTitle = sessionID ? (await fetchSession(sessionID))?.title : undefined
+        const title = sessionTitle || sessionID || "unknown session"
+        const message = error?.data?.message ?? error?.message
+        const detail = typeof message === "string" && message !== "" ? message : undefined
+
+        if (notifyOn.error)
+          await notify($, {
+            title: sessionTitle ? `Error: ${sessionTitle}` : "Error",
+            subtitle: detail,
+          })
+        await log($, `Error in session: ${title}${detail ? `: ${detail}` : ""}`, {
           level: "error",
           source: "opencode",
         })
-        await clearStatus($, "opencode")
+        await showIdle()
 
         if (sessionID) removeAndClose(sessionID)
         return
@@ -444,11 +406,8 @@ const plugin: Plugin = async ({ client, $ }) => {
         const id = getPermissionRequestID(e.properties)
         if (id && !pendingPermissions.has(id)) {
           pendingPermissions.add(id)
-          const title = e.properties.title ?? e.properties.permission ?? "command"
-          await setStatus($, "opencode", "Needs input", {
-            icon: "bell.fill",
-            color: "#4C8DFF",
-          })
+          const title = getPermissionTitle(e.properties)
+          await showNeedsInput()
           if (notifyOn.permission)
             await notify($, { title: "Needs your permission", subtitle: title })
           await log($, `Permission requested: ${title}`, {
@@ -465,12 +424,7 @@ const plugin: Plugin = async ({ client, $ }) => {
           pendingPermissions.delete(id)
         }
 
-        if (!isWaitingForInput()) {
-          await setStatus($, "opencode", "Running", {
-            icon: "bolt.fill",
-            color: "#4C8DFF",
-          })
-        }
+        if (!isWaitingForInput()) await showRunning()
         return
       }
 
@@ -481,10 +435,7 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         const header = e.properties.questions?.[0]?.header ?? "Question"
-        await setStatus($, "opencode", "Needs input", {
-          icon: "bell.fill",
-          color: "#4C8DFF",
-        })
+        await showNeedsInput()
         if (notifyOn.question)
           await notify($, { title: "Has a question", subtitle: header })
         await log($, `Question: ${header}`, { level: "info", source: "opencode" })
@@ -497,12 +448,7 @@ const plugin: Plugin = async ({ client, $ }) => {
           pendingQuestions.delete(id)
         }
 
-        if (!isWaitingForInput()) {
-          await setStatus($, "opencode", "Running", {
-            icon: "bolt.fill",
-            color: "#4C8DFF",
-          })
-        }
+        if (!isWaitingForInput()) await showRunning()
         return
       }
     },
@@ -513,11 +459,8 @@ const plugin: Plugin = async ({ client, $ }) => {
         pendingPermissions.add(id)
       }
 
-      const title = (input as any).title ?? (input as any).permission ?? "command"
-      await setStatus($, "opencode", "Needs input", {
-        icon: "bell.fill",
-        color: "#4C8DFF",
-      })
+      const title = getPermissionTitle(input)
+      await showNeedsInput()
       if (notifyOn.permission)
         await notify($, { title: "Needs your permission", subtitle: title })
       await log($, `Permission requested: ${title}`, {
@@ -528,4 +471,34 @@ const plugin: Plugin = async ({ client, $ }) => {
   }
 }
 
-export default plugin
+const v1Plugin = createPlugin((url, sessionID) => `opencode attach ${url} --session ${sessionID}`)
+const v2Plugin = createPlugin(attachCommand)
+
+// OpenCode 1.18 calls both server() and setup(); only server() then delivers
+// events, so setup() stays quiet to avoid a second set of notifications.
+let serverStarted = false
+
+// The default export is an object: v1 calls server(), v2 calls setup().
+// Checked on OpenCode 1.17.8, 1.18.34 and 2.0.24.
+export default {
+  id: "opencode-cmux",
+  server: ((input) => {
+    serverStarted = true
+    return v1Plugin(input)
+  }) as Plugin,
+  async setup(ctx: any) {
+    const hooks = await v2Plugin({ client: v1Client(ctx.session), $: shell() } as any)
+
+    // No permission hook: v2's "evaluate" runs for every tool call, including
+    // allowed ones. permission.asked fires only when the user is prompted.
+    const controller = new AbortController()
+    void (async () => {
+      for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
+        const event = toV1Event(raw)
+        if (!event || !hooks.event || serverStarted) continue
+        await hooks.event({ event } as any).catch(() => undefined)
+      }
+    })().catch(() => undefined)
+    return () => controller.abort()
+  },
+}
