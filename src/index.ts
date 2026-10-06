@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { LSOF_LISTEN_RE } from "./lsof.js"
+import { attachCommand, shell, toV1Event, v1Client } from "./v2.js"
 import {
   notify,
   setStatus,
@@ -17,9 +18,14 @@ import {
   type SplitDirection,
 } from "./cmux.js"
 
-const plugin: Plugin = async ({ client, $ }) => {
+type AttachCommand = (url: string, sessionID: string) => string | null
+
+const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
+  // Sessions whose turn ended in an error or abort. OpenCode still sends idle
+  // afterwards (1.18 sends it twice), which must not become a Done.
+  const failedSessions = new Set<string>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
@@ -164,6 +170,14 @@ const plugin: Plugin = async ({ client, $ }) => {
     return trimmed === "" ? undefined : trimmed
   }
 
+  // OpenCode 1.18 sends the command as `patterns` with no `title`.
+  function getPermissionTitle(source: any): string {
+    if (typeof source?.title === "string" && source.title.trim() !== "") return source.title
+    const name = source?.permission ?? source?.type ?? "command"
+    const patterns = Array.isArray(source?.patterns) ? source.patterns : []
+    return patterns.length > 0 ? `${name}: ${patterns.join(", ")}` : name
+  }
+
   function getQuestionRequestID(source: any): string | undefined {
     if (!source) return undefined
     const rawID = source.id ?? source.requestID
@@ -194,7 +208,8 @@ const plugin: Plugin = async ({ client, $ }) => {
         const info = e.properties.info
         if (splitsEnabled && info?.parentID) {
           const url = resolveServerUrl()
-          if (url) {
+          const command = url ? attachCommand(url, info.id) : null
+          if (command) {
             await enqueueSplitOp(async () => {
               if (activeSplits.has(info.id)) return
 
@@ -230,8 +245,7 @@ const plugin: Plugin = async ({ client, $ }) => {
               activeSplits.set(info.id, surfaceId)
               agentCount++
 
-              const attachCmd = `opencode attach ${url} --session ${info.id}`
-              await sendToSurface($, surfaceId, attachCmd)
+              await sendToSurface($, surfaceId, command)
               await sendKeyToSurface($, surfaceId, "enter")
 
               if (originalSurfaceId) {
@@ -245,7 +259,10 @@ const plugin: Plugin = async ({ client, $ }) => {
 
       if (e.type === "session.deleted") {
         const info = e.properties.info
-        if (info?.id) removeAndClose(info.id)
+        if (info?.id) {
+          failedSessions.delete(info.id)
+          removeAndClose(info.id)
+        }
         return
       }
 
@@ -253,6 +270,7 @@ const plugin: Plugin = async ({ client, $ }) => {
         const { sessionID, status } = e.properties
 
         if (status.type === "busy") {
+          failedSessions.delete(sessionID)
           if (!isWaitingForInput()) {
             await setStatus($, "opencode", "working", {
               icon: "terminal",
@@ -263,15 +281,16 @@ const plugin: Plugin = async ({ client, $ }) => {
         }
 
         if (status.type === "idle") {
-          if (isWaitingForInput()) {
+          if (failedSessions.has(sessionID) || isWaitingForInput()) {
             return
           }
 
           const session = await fetchSession(sessionID)
-          const title = session?.title ?? sessionID
+          const title = session?.title || sessionID
 
           if (!session?.parentID) {
-            if (notifyOn.done) await notify($, { title: `Done: ${title}` })
+            if (notifyOn.done)
+              await notify($, { title: session?.title ? `Done: ${title}` : "Done" })
             await log($, `Done: ${title}`, { level: "success", source: "opencode" })
             await clearStatus($, "opencode")
           } else {
@@ -291,12 +310,27 @@ const plugin: Plugin = async ({ client, $ }) => {
         pendingQuestions.clear()
 
         const sessionID = e.properties.sessionID
-        const title = sessionID
-          ? (await fetchSession(sessionID))?.title ?? sessionID
-          : "unknown session"
+        if (sessionID) failedSessions.add(sessionID)
 
-        if (notifyOn.error) await notify($, { title: `Error: ${title}` })
-        await log($, `Error in session: ${title}`, {
+        // Esc in the TUI: the user is at the terminal, so no popup.
+        const error = e.properties.error
+        if (error?.name === "MessageAbortedError") {
+          await clearStatus($, "opencode")
+          if (sessionID) removeAndClose(sessionID)
+          return
+        }
+
+        const sessionTitle = sessionID ? (await fetchSession(sessionID))?.title : undefined
+        const title = sessionTitle || sessionID || "unknown session"
+        const message = error?.data?.message ?? error?.message
+        const detail = typeof message === "string" && message !== "" ? message : undefined
+
+        if (notifyOn.error)
+          await notify($, {
+            title: sessionTitle ? `Error: ${sessionTitle}` : "Error",
+            subtitle: detail,
+          })
+        await log($, `Error in session: ${title}${detail ? `: ${detail}` : ""}`, {
           level: "error",
           source: "opencode",
         })
@@ -310,7 +344,7 @@ const plugin: Plugin = async ({ client, $ }) => {
         const id = getPermissionRequestID(e.properties)
         if (id && !pendingPermissions.has(id)) {
           pendingPermissions.add(id)
-          const title = e.properties.title ?? e.properties.permission ?? "command"
+          const title = getPermissionTitle(e.properties)
           await setStatus($, "opencode", "waiting", {
             icon: "lock",
             color: "#ef4444",
@@ -379,7 +413,7 @@ const plugin: Plugin = async ({ client, $ }) => {
         pendingPermissions.add(id)
       }
 
-      const title = (input as any).title ?? (input as any).permission ?? "command"
+      const title = getPermissionTitle(input)
       await setStatus($, "opencode", "waiting", {
         icon: "lock",
         color: "#ef4444",
@@ -394,4 +428,34 @@ const plugin: Plugin = async ({ client, $ }) => {
   }
 }
 
-export default plugin
+const v1Plugin = createPlugin((url, sessionID) => `opencode attach ${url} --session ${sessionID}`)
+const v2Plugin = createPlugin(attachCommand)
+
+// OpenCode 1.18 calls both server() and setup(); only server() then delivers
+// events, so setup() stays quiet to avoid a second set of notifications.
+let serverStarted = false
+
+// The default export is an object: v1 calls server(), v2 calls setup().
+// Checked on OpenCode 1.17.8, 1.18.34 and 2.0.24.
+export default {
+  id: "opencode-cmux",
+  server: ((input) => {
+    serverStarted = true
+    return v1Plugin(input)
+  }) as Plugin,
+  async setup(ctx: any) {
+    const hooks = await v2Plugin({ client: v1Client(ctx.session), $: shell() } as any)
+
+    // No permission hook: v2's "evaluate" runs for every tool call, including
+    // allowed ones. permission.asked fires only when the user is prompted.
+    const controller = new AbortController()
+    void (async () => {
+      for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
+        const event = toV1Event(raw)
+        if (!event || !hooks.event || serverStarted) continue
+        await hooks.event({ event } as any).catch(() => undefined)
+      }
+    })().catch(() => undefined)
+    return () => controller.abort()
+  },
+}
