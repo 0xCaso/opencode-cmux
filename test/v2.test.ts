@@ -115,6 +115,7 @@ test("setup drives cmux from v2 events", () => {
       ...process.env,
       CMUX_BUNDLED_CLI_PATH: fakeCmux,
       CMUX_WORKSPACE_ID: "workspace:test",
+      CMUX_SURFACE_ID: "surface:test",
       XDG_CONFIG_HOME: dir,
       TMUX_PANE: "",
     },
@@ -132,11 +133,25 @@ test("setup drives cmux from v2 events", () => {
     [
       "rpc",
       "notification.create",
-      JSON.stringify({ title: "Needs your permission", body: "shell: echo `id` $HOME" }),
+      JSON.stringify({
+        title: "Needs your permission",
+        body: "shell: echo `id` $HOME",
+        workspace_id: "workspace:test",
+        surface_id: "surface:test",
+      }),
     ],
     ["log", "--level", "info", "--source", "opencode", "--", "Permission requested: shell: echo `id` $HOME"],
     ["set-status", "opencode", "working", "--icon", "terminal", "--color", "#f59e0b"],
-    ["rpc", "notification.create", JSON.stringify({ title: "Done: My session", body: "" })],
+    [
+      "rpc",
+      "notification.create",
+      JSON.stringify({
+        title: "Done: My session",
+        body: "",
+        workspace_id: "workspace:test",
+        surface_id: "surface:test",
+      }),
+    ],
     ["log", "--level", "success", "--source", "opencode", "--", "Done: My session"],
     ["clear-status", "opencode"],
   ])
