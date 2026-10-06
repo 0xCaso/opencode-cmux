@@ -77,15 +77,19 @@ By default OpenCode 2 runs sessions in one shared background service, and plugin
 
 ## What it does
 
+The sidebar uses the same states cmux shows for Claude Code and Codex.
+
 | Event | cmux action |
 |---|---|
-| Session starts working | Sidebar status: "working" (amber, terminal icon) |
-| Session completes (primary) | Desktop notification + log + clear status |
+| Session starts working or retries | Sidebar status: "Running" (blue, `bolt.fill`) |
+| Session completes (primary) | Desktop notification with the start of the final response + log + sidebar status: "Idle" (gray, `pause.circle.fill`) |
 | Session completes (subagent) | Log only (no notification spam) |
-| Session error | Desktop notification with the error message + log + clear status |
-| Session interrupted (Esc) | Clear status (no notification) |
-| Permission requested | Desktop notification + sidebar status: "waiting" (red, lock icon) |
-| AI has a question (`question` tool) | Desktop notification + sidebar status: "question" (purple) |
+| Session error | Desktop notification with the error message + log + "Idle" |
+| Session interrupted (Esc) | "Idle" (no notification) |
+| Permission requested | Desktop notification + sidebar status: "Needs input" (blue, `bell.fill`) |
+| AI has a question (`question` tool) | Desktop notification + "Needs input" |
+
+"Needs input" stays until every pending permission and question is answered.
 
 ## How it works
 

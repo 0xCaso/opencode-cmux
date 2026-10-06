@@ -11,6 +11,14 @@ const events = [
     data: { id: "per_1", sessionID, action: "shell", resources: ["echo `id` $HOME"] },
   },
   { type: "permission.replied", data: { sessionID, requestID: "per_1", reply: "once" } },
+  {
+    type: "session.step.started",
+    data: { sessionID, assistantMessageID: "msg_1", agent: "build" },
+  },
+  {
+    type: "session.text.ended",
+    data: { sessionID, assistantMessageID: "msg_1", ordinal: 0, text: "Printed\n  the id." },
+  },
   { type: "session.execution.succeeded", data: { sessionID } },
 ]
 

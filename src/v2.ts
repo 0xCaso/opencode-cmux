@@ -57,6 +57,25 @@ export function toV1Event(event: any): { type: string; properties: any } | undef
       }
     case "session.execution.failed":
       return { type: "session.error", properties: { sessionID, error: data.error } }
+    // Each step writes one assistant message; its text ends up in text.ended.
+    case "session.step.started":
+      return {
+        type: "message.updated",
+        properties: { info: { id: data.assistantMessageID, sessionID, role: "assistant" } },
+      }
+    case "session.text.ended":
+      return {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            id: `text:${data.ordinal}`,
+            sessionID,
+            messageID: data.assistantMessageID,
+            type: "text",
+            text: data.text,
+          },
+        },
+      }
     case "session.created":
       return {
         type: "session.created",

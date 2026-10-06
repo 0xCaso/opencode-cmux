@@ -55,6 +55,21 @@ const busy = { type: "session.status", properties: { sessionID, status: { type: 
 const idle = { type: "session.status", properties: { sessionID, status: { type: "idle" } } }
 const notifications = (calls: string[][]) =>
   calls.filter((c) => c[1] === "notification.create").map((c) => JSON.parse(c[2]!))
+const statuses = (calls: string[][]) => calls.filter((c) => c[0] === "set-status")
+
+// The states cmux uses for its own Claude Code and Codex integrations.
+const runningStatus = ["set-status", "opencode", "Running", "--icon", "bolt.fill", "--color", "#4C8DFF"]
+const idleStatus = ["set-status", "opencode", "Idle", "--icon", "pause.circle.fill", "--color", "#8E8E93"]
+const needsInputStatus = ["set-status", "opencode", "Needs input", "--icon", "bell.fill", "--color", "#4C8DFF"]
+
+const assistant = (id: string, session = sessionID) => ({
+  type: "message.updated",
+  properties: { sessionID: session, info: { id, sessionID: session, role: "assistant" } },
+})
+const text = (messageID: string, id: string, value: string, session = sessionID) => ({
+  type: "message.part.updated",
+  properties: { sessionID: session, part: { id, sessionID: session, messageID, type: "text", text: value } },
+})
 
 test("a failed turn notifies the error once and no Done", async () => {
   const error = {
@@ -91,7 +106,7 @@ test("pressing Esc clears the status without notifying", async () => {
   }
   const calls = await run([busy, permission, aborted, idle, idle])
   expect(notifications(calls).map((n) => n.title)).toEqual(["Needs your permission"])
-  expect(calls.at(-1)).toEqual(["clear-status", "opencode"])
+  expect(calls.at(-1)).toEqual(idleStatus)
 })
 
 test("the next turn after an error still notifies Done", async () => {
@@ -132,4 +147,66 @@ test("a session with no title yet is not shown by its id", async () => {
   const calls = await run([busy, idle, busy, error], "")
   expect(notifications(calls).map((n) => n.title)).toEqual(["Done", "Error"])
   expect(calls).toContainEqual(["log", "--level", "success", "--source", "opencode", "--", `Done: ${sessionID}`])
+})
+
+test("statuses match cmux's Running, Idle and Needs input", async () => {
+  const retry = { type: "session.status", properties: { sessionID, status: { type: "retry", attempt: 1 } } }
+  const calls = await run([busy, retry, idle])
+  expect(statuses(calls)).toEqual([runningStatus, runningStatus, idleStatus])
+  expect(calls).not.toContainEqual(["clear-status", "opencode"])
+})
+
+test("Needs input stays until every permission and question is answered", async () => {
+  const calls = await run([
+    busy,
+    { type: "permission.asked", properties: { id: "per_1", sessionID, permission: "bash", patterns: ["ls"] } },
+    { type: "question.asked", properties: { id: "que_1", sessionID, questions: [{ header: "Pick one" }] } },
+    { type: "permission.replied", properties: { sessionID, requestID: "per_1", reply: "once" } },
+    { type: "question.replied", properties: { id: "que_1", sessionID } },
+  ])
+  expect(statuses(calls)).toEqual([runningStatus, needsInputStatus, needsInputStatus, runningStatus])
+})
+
+test("Done shows the final assistant response", async () => {
+  const user = { type: "message.updated", properties: { sessionID, info: { id: "msg_u", sessionID, role: "user" } } }
+  const calls = await run([
+    busy,
+    user,
+    text("msg_u", "prt_u", "the prompt"),
+    assistant("msg_a1"),
+    text("msg_a1", "prt_1", "Looking at the files."),
+    assistant("msg_a2"),
+    text("msg_a2", "prt_2", ""),
+    text("msg_a2", "prt_2", " All\n  tests pass. "),
+    text("msg_a2", "prt_3", "Done."),
+    idle,
+  ])
+  expect(notifications(calls)[0]).toMatchObject({
+    title: "Done: Titolo di prova",
+    body: "All tests pass. Done.",
+  })
+})
+
+test("a long response is cut at 200 characters without splitting an emoji", async () => {
+  const family = "👨‍👩‍👧‍👦"
+  const calls = await run([busy, assistant("msg_a"), text("msg_a", "prt_1", `${"a".repeat(198)}${family}more`), idle])
+  expect(notifications(calls)[0].body).toBe(`${"a".repeat(198)}${family}…`)
+})
+
+test("an errored turn's response does not show in the next Done", async () => {
+  const error = { type: "session.error", properties: { sessionID, error: { name: "APIError" } } }
+  const calls = await run([busy, assistant("msg_a"), text("msg_a", "prt_1", "half an answer"), error, idle, busy, idle])
+  expect(notifications(calls).map((n) => n.body)).toEqual(["", ""])
+  expect(statuses(calls)).toEqual([runningStatus, idleStatus, runningStatus, idleStatus])
+})
+
+test("a subagent finishing leaves the status alone", async () => {
+  const { $, calls } = recordingShell()
+  const client = {
+    session: { get: async () => ({ data: { id: "ses_child", title: "Child", parentID: sessionID } }) },
+  }
+  const hooks = await (plugin as any).server({ client, $ })
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: "ses_child", status: { type: "idle" } } } })
+  expect(notifications(calls)).toEqual([])
+  expect(statuses(calls)).toEqual([])
 })

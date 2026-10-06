@@ -8,7 +8,6 @@ import { attachCommand, shell, toV1Event, v1Client } from "./v2.js"
 import {
   notify,
   setStatus,
-  clearStatus,
   log,
   createSplit,
   closeSurface,
@@ -20,12 +19,30 @@ import {
 
 type AttachCommand = (url: string, sessionID: string) => string | null
 
+// The states cmux shows for its own Claude Code and Codex integrations (0.65).
+const RUNNING = { icon: "bolt.fill", color: "#4C8DFF" }
+const IDLE = { icon: "pause.circle.fill", color: "#8E8E93" }
+const NEEDS_INPUT = { icon: "bell.fill", color: "#4C8DFF" }
+
+const SUMMARY_LENGTH = 200
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+// Keeps per-message maps from growing for the whole life of the server.
+function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
+  map.delete(key)
+  map.set(key, value)
+  if (map.size > 300) map.delete(map.keys().next().value as K)
+}
+
 const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, $ }) => {
   const pendingPermissions = new Set<string>()
   const pendingQuestions = new Set<string>()
   // Sessions whose turn ended in an error or abort. OpenCode still sends idle
   // afterwards (1.18 sends it twice), which must not become a Done.
   const failedSessions = new Set<string>()
+  // The latest assistant message of each session, shown in the Done popup.
+  const assistantMessages = new Map<string, string>()
+  const responses = new Map<string, { messageID: string; parts: Map<string, string> }>()
 
   const originalSurfaceId = process.env.CMUX_SURFACE_ID
 
@@ -162,6 +179,42 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
     return pendingPermissions.size > 0 || pendingQuestions.size > 0
   }
 
+  const showRunning = () => setStatus($, "opencode", "Running", RUNNING)
+  const showIdle = () => setStatus($, "opencode", "Idle", IDLE)
+  const showNeedsInput = () => setStatus($, "opencode", "Needs input", NEEDS_INPUT)
+
+  function trackMessage(e: any): void {
+    if (e.type === "message.updated") {
+      const info = e.properties?.info
+      if (info?.role !== "assistant" || typeof info.id !== "string") return
+      if (typeof info.sessionID !== "string") return
+      remember(assistantMessages, info.id, info.sessionID)
+      if (responses.get(info.sessionID)?.messageID !== info.id)
+        remember(responses, info.sessionID, { messageID: info.id, parts: new Map() })
+      return
+    }
+
+    const part = e.properties?.part
+    if (part?.type !== "text" || typeof part.id !== "string") return
+    const sessionID = assistantMessages.get(part.messageID)
+    const response = sessionID ? responses.get(sessionID) : undefined
+    if (!response || response.messageID !== part.messageID) return
+    const text = typeof part.text === "string" ? part.text.replace(/\s+/g, " ").trim() : ""
+    response.parts.set(part.id, text)
+  }
+
+  // Takes the summary out, so a later turn never shows a stale response.
+  function takeSummary(sessionID: string): string | undefined {
+    const response = responses.get(sessionID)
+    responses.delete(sessionID)
+    const text = response ? [...response.parts.values()].filter(Boolean).join(" ") : ""
+    if (!text) return undefined
+    const chars = Array.from(graphemes.segment(text), ({ segment }) => segment)
+    return chars.length > SUMMARY_LENGTH
+      ? `${chars.slice(0, SUMMARY_LENGTH - 1).join("")}…`
+      : text
+  }
+
   function getPermissionRequestID(source: any): string | undefined {
     if (!source) return undefined
     const rawID = source.id ?? source.requestID ?? source.permissionID
@@ -203,6 +256,11 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
   return {
     async event({ event }) {
       const e = event as any
+
+      if (e.type === "message.updated" || e.type === "message.part.updated") {
+        trackMessage(e)
+        return
+      }
 
       if (e.type === "session.created") {
         const info = e.properties.info
@@ -261,6 +319,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
         const info = e.properties.info
         if (info?.id) {
           failedSessions.delete(info.id)
+          responses.delete(info.id)
           removeAndClose(info.id)
         }
         return
@@ -269,14 +328,9 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
       if (e.type === "session.status") {
         const { sessionID, status } = e.properties
 
-        if (status.type === "busy") {
+        if (status.type === "busy" || status.type === "retry") {
           failedSessions.delete(sessionID)
-          if (!isWaitingForInput()) {
-            await setStatus($, "opencode", "working", {
-              icon: "terminal",
-              color: "#f59e0b",
-            })
-          }
+          if (!isWaitingForInput()) await showRunning()
           return
         }
 
@@ -288,11 +342,16 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
           const session = await fetchSession(sessionID)
           const title = session?.title || sessionID
 
+          const summary = takeSummary(sessionID)
+
           if (!session?.parentID) {
             if (notifyOn.done)
-              await notify($, { title: session?.title ? `Done: ${title}` : "Done" })
+              await notify($, {
+                title: session?.title ? `Done: ${title}` : "Done",
+                body: summary,
+              })
             await log($, `Done: ${title}`, { level: "success", source: "opencode" })
-            await clearStatus($, "opencode")
+            await showIdle()
           } else {
             await log($, `Subagent finished: ${title}`, {
               level: "info",
@@ -310,12 +369,15 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
         pendingQuestions.clear()
 
         const sessionID = e.properties.sessionID
-        if (sessionID) failedSessions.add(sessionID)
+        if (sessionID) {
+          failedSessions.add(sessionID)
+          responses.delete(sessionID)
+        }
 
         // Esc in the TUI: the user is at the terminal, so no popup.
         const error = e.properties.error
         if (error?.name === "MessageAbortedError") {
-          await clearStatus($, "opencode")
+          await showIdle()
           if (sessionID) removeAndClose(sessionID)
           return
         }
@@ -334,7 +396,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
           level: "error",
           source: "opencode",
         })
-        await clearStatus($, "opencode")
+        await showIdle()
 
         if (sessionID) removeAndClose(sessionID)
         return
@@ -345,10 +407,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
         if (id && !pendingPermissions.has(id)) {
           pendingPermissions.add(id)
           const title = getPermissionTitle(e.properties)
-          await setStatus($, "opencode", "waiting", {
-            icon: "lock",
-            color: "#ef4444",
-          })
+          await showNeedsInput()
           if (notifyOn.permission)
             await notify($, { title: "Needs your permission", subtitle: title })
           await log($, `Permission requested: ${title}`, {
@@ -365,12 +424,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
           pendingPermissions.delete(id)
         }
 
-        if (!isWaitingForInput()) {
-          await setStatus($, "opencode", "working", {
-            icon: "terminal",
-            color: "#f59e0b",
-          })
-        }
+        if (!isWaitingForInput()) await showRunning()
         return
       }
 
@@ -381,10 +435,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
         }
 
         const header = e.properties.questions?.[0]?.header ?? "Question"
-        await setStatus($, "opencode", "question", {
-          icon: "help-circle",
-          color: "#a855f7",
-        })
+        await showNeedsInput()
         if (notifyOn.question)
           await notify($, { title: "Has a question", subtitle: header })
         await log($, `Question: ${header}`, { level: "info", source: "opencode" })
@@ -397,12 +448,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
           pendingQuestions.delete(id)
         }
 
-        if (!isWaitingForInput()) {
-          await setStatus($, "opencode", "working", {
-            icon: "terminal",
-            color: "#f59e0b",
-          })
-        }
+        if (!isWaitingForInput()) await showRunning()
         return
       }
     },
@@ -414,10 +460,7 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
       }
 
       const title = getPermissionTitle(input)
-      await setStatus($, "opencode", "waiting", {
-        icon: "lock",
-        color: "#ef4444",
-      })
+      await showNeedsInput()
       if (notifyOn.permission)
         await notify($, { title: "Needs your permission", subtitle: title })
       await log($, `Permission requested: ${title}`, {

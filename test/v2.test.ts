@@ -36,6 +36,29 @@ test("v2 session.status is dropped so a turn is not handled twice", () => {
   expect(toV1Event({ type: "session.created" })).toBeUndefined()
 })
 
+test("assistant steps and text become v1 message events", () => {
+  expect(
+    toV1Event({
+      type: "session.step.started",
+      data: { sessionID, assistantMessageID: "msg_1", agent: "build" },
+    }),
+  ).toEqual({
+    type: "message.updated",
+    properties: { info: { id: "msg_1", sessionID, role: "assistant" } },
+  })
+  expect(
+    toV1Event({
+      type: "session.text.ended",
+      data: { sessionID, assistantMessageID: "msg_1", ordinal: 2, text: "Hi" },
+    }),
+  ).toEqual({
+    type: "message.part.updated",
+    properties: {
+      part: { id: "text:2", sessionID, messageID: "msg_1", type: "text", text: "Hi" },
+    },
+  })
+})
+
 test("session lifecycle events carry v1 info", () => {
   expect(
     toV1Event({
@@ -184,8 +207,8 @@ test("setup drives cmux from v2 events", () => {
     .split("\n")
     .map((line) => JSON.parse(line))
   expect(calls).toEqual([
-    ["set-status", "opencode", "working", "--icon", "terminal", "--color", "#f59e0b"],
-    ["set-status", "opencode", "waiting", "--icon", "lock", "--color", "#ef4444"],
+    ["set-status", "opencode", "Running", "--icon", "bolt.fill", "--color", "#4C8DFF"],
+    ["set-status", "opencode", "Needs input", "--icon", "bell.fill", "--color", "#4C8DFF"],
     [
       "rpc",
       "notification.create",
@@ -197,18 +220,18 @@ test("setup drives cmux from v2 events", () => {
       }),
     ],
     ["log", "--level", "info", "--source", "opencode", "--", "Permission requested: shell: echo `id` $HOME"],
-    ["set-status", "opencode", "working", "--icon", "terminal", "--color", "#f59e0b"],
+    ["set-status", "opencode", "Running", "--icon", "bolt.fill", "--color", "#4C8DFF"],
     [
       "rpc",
       "notification.create",
       JSON.stringify({
         title: "Done: My session",
-        body: "",
+        body: "Printed the id.",
         workspace_id: "workspace:test",
         surface_id: "surface:test",
       }),
     ],
     ["log", "--level", "success", "--source", "opencode", "--", "Done: My session"],
-    ["clear-status", "opencode"],
+    ["set-status", "opencode", "Idle", "--icon", "pause.circle.fill", "--color", "#8E8E93"],
   ])
 })
