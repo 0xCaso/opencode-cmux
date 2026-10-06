@@ -67,6 +67,10 @@ Without `--port`, splits are silently skipped even when enabled.
 
 OpenCode 2 has no `opencode attach` and every server asks for a password. The split runs `opencode --server <url> --session <id>`, so it works only when `OPENCODE_SERVER_PASSWORD` is exported in your shell profile, where both OpenCode and the new pane can read it. Without it, splits are skipped.
 
+## cmux's own OpenCode integration
+
+cmux 0.65 can install its own OpenCode plugins with `cmux hooks setup` (or `cmux hooks opencode install`). They go in `~/.config/opencode/plugins/cmux-session.js` and `cmux-feed.js`. With those and this plugin both loaded, every finished turn shows two notifications. Keep one of them: remove cmux's with `cmux hooks opencode uninstall`, or remove `opencode-cmux` from `opencode.json`.
+
 ## OpenCode 2 background service
 
 By default OpenCode 2 runs sessions in one shared background service, and plugins run inside it. The service keeps the cmux variables of the tab that started it, so notifications from other tabs open that first tab. Start OpenCode with `--standalone` to give each tab its own server and the right notification target.
