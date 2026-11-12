@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { execSync } from "node:child_process"
+import { execFileSync } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -124,9 +124,10 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
     // 2. Find the TCP port this process is listening on via lsof.
     //    Use -a to AND the -p and -iTCP filters (macOS lsof ORs by default).
     try {
-      const out = execSync(
-        `lsof -nP -a -p ${process.pid} -iTCP -sTCP:LISTEN 2>/dev/null`,
-        { encoding: "utf-8", timeout: 3000 },
+      const out = execFileSync(
+        "lsof",
+        ["-nP", "-a", "-p", String(process.pid), "-iTCP", "-sTCP:LISTEN"],
+        { encoding: "utf-8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] },
       )
       for (const line of out.split("\n")) {
         const match = line.match(LSOF_LISTEN_RE)
