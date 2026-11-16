@@ -76,7 +76,7 @@ cmux 0.65 can install its own OpenCode plugins with `cmux hooks setup` (or `cmux
 
 By default OpenCode 2 runs sessions in one shared background service, and plugins run inside it. The service keeps the cmux variables of the tab that started it, so notifications from other tabs open that first tab. There are two ways to fix the target:
 
-- Set `"resolution": "cwd"` in `opencode-cmux.json` (recommended). The plugin then matches the session's working directory against the open cmux workspaces and addresses notifications, sidebar statuses, and log entries to the workspace the session ran in. When several workspaces share one directory, the workspace with a running OpenCode TUI (the TUI titles its pane `OC | …`) is preferred. Resolutions are cached for 10 seconds and fall back to the environment when nothing matches.
+- Set `"resolution": "cwd"` in `opencode-cmux.json` (recommended). The plugin then matches the session's working directory against the open cmux workspaces — preferring an exact match, then the longest matching prefix — and addresses notifications, sidebar statuses, and log entries to the workspace the session ran in. When several workspaces share a directory, the workspace with a running OpenCode TUI (the TUI titles its pane `OC | …`) is preferred. Resolutions are cached for 10 seconds. A session whose directory belongs to no open workspace (e.g. a temp directory) is not delivered anywhere, so the tab that started the service is not rung; the environment is used only when the directory is unknown or cmux cannot be queried.
 - Start OpenCode with `--standalone` to give each tab its own server and the right notification target without directory matching.
 
 ## What it does
