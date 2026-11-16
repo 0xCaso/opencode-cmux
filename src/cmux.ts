@@ -97,22 +97,35 @@ export async function resolveWorkspaceByDirectory(
 ): Promise<WorkspaceTarget> {
   try {
     const workspaces = await listWorkspaces($)
-    const candidates = workspaces.filter(
-      (w) =>
-        typeof w.current_directory === "string" &&
-        (w.current_directory === directory ||
-          directory.startsWith(w.current_directory + "/")),
+    const dirs = workspaces.filter(
+      (w): w is WorkspaceInfo & { current_directory: string } =>
+        typeof w.current_directory === "string",
     )
+    // Prefer an exact match, then the longest prefix: with workspaces at
+    // /repo and /repo/pkg, a session in /repo/pkg belongs to the latter.
+    let candidates = dirs.filter((w) => w.current_directory === directory)
+    if (candidates.length === 0) {
+      const prefixed = dirs.filter((w) =>
+        directory.startsWith(w.current_directory + "/"),
+      )
+      const longest = prefixed.reduce(
+        (n, w) => Math.max(n, w.current_directory.length),
+        0,
+      )
+      candidates = prefixed.filter(
+        (w) => w.current_directory.length === longest,
+      )
+    }
     if (candidates.length === 1) {
       return { id: candidates[0].id, fromEnv: false }
     }
     if (candidates.length > 1) {
       for (const candidate of candidates) {
         const panels = await listPanels($, candidate.id)
+        // Only the TUI's own "OC | …" title counts: a pane whose title merely
+        // mentions "opencode" (e.g. a shell in this repo) is not a TUI.
         const runsOpenCode = panels.some(
-          (p) =>
-            typeof p.title === "string" &&
-            (/^\s*OC\s*\|/.test(p.title) || p.title.includes("opencode")),
+          (p) => typeof p.title === "string" && /^\s*OC\s*\|/.test(p.title),
         )
         if (runsOpenCode) return { id: candidate.id, fromEnv: false }
       }

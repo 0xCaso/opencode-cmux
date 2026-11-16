@@ -137,6 +137,115 @@ test("cwd resolution reuses the resolved workspace for the reply path", async ()
   expect(idleStatus[idleStatus.indexOf("--workspace") + 1]).toBe(workB)
 })
 
+async function runWith(
+  resolution: "cwd" | "env",
+  workspacesJSON: string,
+  panels: Record<string, string>,
+  directory: string,
+  events: { type: string; properties: any }[],
+  onGet?: () => void,
+) {
+  setup(resolution)
+  const { $, calls } = fakeShell(workspacesJSON, panels)
+  const client = {
+    session: {
+      get: async () => {
+        onGet?.()
+        return {
+          data: { id: sessionID, title: "Titolo di prova", location: { directory } },
+        }
+      },
+    },
+  }
+  const hooks = await (plugin as any).server({ client, $ })
+  for (const event of events) await hooks.event({ event })
+  return calls
+}
+
+function firstNotification(calls: string[][]) {
+  return calls
+    .filter((c) => c[1] === "notification.create")
+    .map((c) => JSON.parse(c[2]!))[0]
+}
+
+test("cwd resolution prefers an exact match over a parent running the TUI", async () => {
+  const workspacesJSON = JSON.stringify({
+    workspaces: [
+      { id: workA, current_directory: "/repo" },
+      { id: workB, current_directory: "/repo/pkg" },
+    ],
+  })
+  const calls = await runWith(
+    "cwd",
+    workspacesJSON,
+    {
+      [workA]: JSON.stringify({ surfaces: [{ title: "OC | parent" }] }),
+      [workB]: JSON.stringify({ surfaces: [{ title: "zsh" }] }),
+    },
+    "/repo/pkg",
+    [idle],
+  )
+  expect(firstNotification(calls).workspace_id).toBe(workB)
+})
+
+test("cwd resolution picks the longest matching prefix", async () => {
+  const workspacesJSON = JSON.stringify({
+    workspaces: [
+      { id: workA, current_directory: "/repo" },
+      { id: workB, current_directory: "/repo/pkg" },
+    ],
+  })
+  // Neither candidate matches exactly, and the parent runs a TUI: the deeper
+  // directory must still win.
+  const calls = await runWith(
+    "cwd",
+    workspacesJSON,
+    {
+      [workA]: JSON.stringify({ surfaces: [{ title: "OC | parent" }] }),
+      [workB]: JSON.stringify({ surfaces: [{ title: "zsh" }] }),
+    },
+    "/repo/pkg/src",
+    [idle],
+  )
+  expect(firstNotification(calls).workspace_id).toBe(workB)
+})
+
+test("cwd resolution ignores panes that merely mention opencode", async () => {
+  const workspacesJSON = JSON.stringify({
+    workspaces: [
+      { id: workA, current_directory: "/proj" },
+      { id: workB, current_directory: "/proj" },
+    ],
+  })
+  const calls = await runWith(
+    "cwd",
+    workspacesJSON,
+    {
+      // A shell in the repo's folder, not an OpenCode TUI.
+      [workA]: JSON.stringify({ surfaces: [{ title: "/proj — opencode logs" }] }),
+      [workB]: JSON.stringify({ surfaces: [{ title: "OC | Fix the bug" }] }),
+    },
+    "/proj/sub",
+    [idle],
+  )
+  expect(firstNotification(calls).workspace_id).toBe(workB)
+})
+
+test("env resolution does not fetch the session for status events", async () => {
+  let gets = 0
+  const calls = await runWith(
+    "env",
+    JSON.stringify(workspaces),
+    { [workA]: JSON.stringify(panelsA), [workB]: JSON.stringify(panelsB) },
+    "/proj",
+    [busy, permission],
+    () => gets++,
+  )
+  expect(gets).toBe(0)
+  // Still addressed to the environment workspace.
+  expect(firstNotification(calls).workspace_id).toBe(workA)
+})
+
 test("sessions outside every workspace are skipped instead of ringing the wrong tab", async () => {
   const { $, calls } = fakeShell(JSON.stringify(workspaces), {
     [workA]: JSON.stringify(panelsA),

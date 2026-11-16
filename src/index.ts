@@ -288,7 +288,9 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
   }
 
   async function workspaceForSessionID(sessionID?: string): Promise<WorkspaceTarget> {
-    if (!sessionID) return envWorkspaceTarget()
+    // In the default mode the env target needs no session lookup: short-circuit
+    // before fetching so busy/permission events keep their previous cost.
+    if (resolution !== "cwd" || !sessionID) return envWorkspaceTarget()
     return workspaceFromSession(await fetchSession(sessionID))
   }
 
