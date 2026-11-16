@@ -14,6 +14,9 @@ import {
   focusSurface,
   sendToSurface,
   sendKeyToSurface,
+  resolveWorkspaceByDirectory,
+  envWorkspaceTarget,
+  type WorkspaceTarget,
   type SplitDirection,
 } from "./cmux.js"
 
@@ -35,8 +38,8 @@ function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
 }
 
 const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, $ }) => {
-  const pendingPermissions = new Set<string>()
-  const pendingQuestions = new Set<string>()
+  const pendingPermissions = new Map<string, WorkspaceTarget | undefined>()
+  const pendingQuestions = new Map<string, WorkspaceTarget | undefined>()
   // Sessions whose turn ended in an error or abort. OpenCode still sends idle
   // afterwards (1.18 sends it twice), which must not become a Done.
   const failedSessions = new Set<string>()
@@ -48,6 +51,10 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
 
   // Read plugin config (once at init)
   let splitsEnabled = false
+  // "env": address the workspace recorded in the server environment (default).
+  // "cwd": resolve the workspace from the session's working directory, so a
+  // shared background service notifies the tab the session actually ran in.
+  let resolution: "env" | "cwd" = "env"
   const notifyOn: { done: boolean; permission: boolean; question: boolean; error: boolean } = {
     done: true,
     permission: true,
@@ -63,6 +70,15 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
     const config = JSON.parse(raw)
     if (config.splits === true) {
       splitsEnabled = true
+    }
+    if (config.resolution !== undefined) {
+      if (config.resolution === "cwd" || config.resolution === "env") {
+        resolution = config.resolution
+      } else {
+        console.warn(
+          `[opencode-cmux] config.resolution ignored: expected "cwd" or "env", got ${typeof config.resolution}`,
+        )
+      }
     }
     if (config.notifications !== undefined) {
       if (
@@ -180,10 +196,6 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
     return pendingPermissions.size > 0 || pendingQuestions.size > 0
   }
 
-  const showRunning = () => setStatus($, "opencode", "Running", RUNNING)
-  const showIdle = () => setStatus($, "opencode", "Idle", IDLE)
-  const showNeedsInput = () => setStatus($, "opencode", "Needs input", NEEDS_INPUT)
-
   function trackMessage(e: any): void {
     if (e.type === "message.updated") {
       const info = e.properties?.info
@@ -242,17 +254,53 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
 
   async function fetchSession(
     sessionID: string,
-  ): Promise<{ title: string; parentID?: string } | null> {
+  ): Promise<
+    | {
+        title?: string
+        parentID?: string
+        location?: { directory?: string }
+        directory?: string
+      }
+    | null
+  > {
     try {
       const result = await client.session.get({ path: { id: sessionID } })
-      if (result.data) {
-        return { title: result.data.title, parentID: result.data.parentID }
-      }
-      return null
+      return result.data ?? null
     } catch {
       return null
     }
   }
+
+  // Cache of directory → workspace resolution. Workspaces open and close, so
+  // entries expire quickly instead of living for the life of the server.
+  const wsCache = new Map<string, { target: WorkspaceTarget; ts: number }>()
+  const WS_TTL_MS = 10_000
+
+  async function workspaceFromSession(
+    session: Awaited<ReturnType<typeof fetchSession>>,
+  ): Promise<WorkspaceTarget> {
+    const directory = session?.location?.directory ?? session?.directory
+    if (resolution !== "cwd" || !directory) return envWorkspaceTarget()
+    const hit = wsCache.get(directory)
+    if (hit && Date.now() - hit.ts < WS_TTL_MS) return hit.target
+    const target = await resolveWorkspaceByDirectory($, directory)
+    wsCache.set(directory, { target, ts: Date.now() })
+    return target
+  }
+
+  async function workspaceForSessionID(sessionID?: string): Promise<WorkspaceTarget> {
+    // In the default mode the env target needs no session lookup: short-circuit
+    // before fetching so busy/permission events keep their previous cost.
+    if (resolution !== "cwd" || !sessionID) return envWorkspaceTarget()
+    return workspaceFromSession(await fetchSession(sessionID))
+  }
+
+  const showRunning = (workspace?: WorkspaceTarget) =>
+    setStatus($, "opencode", "Running", RUNNING, workspace)
+  const showIdle = (workspace?: WorkspaceTarget) =>
+    setStatus($, "opencode", "Idle", IDLE, workspace)
+  const showNeedsInput = (workspace?: WorkspaceTarget) =>
+    setStatus($, "opencode", "Needs input", NEEDS_INPUT, workspace)
 
   return {
     async event({ event }) {
@@ -331,7 +379,8 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
 
         if (status.type === "busy" || status.type === "retry") {
           failedSessions.delete(sessionID)
-          if (!isWaitingForInput()) await showRunning()
+          if (!isWaitingForInput())
+            await showRunning(await workspaceForSessionID(sessionID))
           return
         }
 
@@ -345,19 +394,29 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
 
           const summary = takeSummary(sessionID)
 
+          const workspace = await workspaceFromSession(session)
           if (!session?.parentID) {
             if (notifyOn.done)
-              await notify($, {
-                title: session?.title ? `Done: ${title}` : "Done",
-                body: summary,
-              })
-            await log($, `Done: ${title}`, { level: "success", source: "opencode" })
-            await showIdle()
+              await notify(
+                $,
+                {
+                  title: session?.title ? `Done: ${title}` : "Done",
+                  body: summary,
+                },
+                workspace,
+              )
+            await log($, `Done: ${title}`, { level: "success", source: "opencode" }, workspace)
+            await showIdle(workspace)
           } else {
-            await log($, `Subagent finished: ${title}`, {
-              level: "info",
-              source: "opencode",
-            })
+            await log(
+              $,
+              `Subagent finished: ${title}`,
+              {
+                level: "info",
+                source: "opencode",
+              },
+              workspace,
+            )
 
             removeAndClose(sessionID)
           }
@@ -383,21 +442,32 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
           return
         }
 
-        const sessionTitle = sessionID ? (await fetchSession(sessionID))?.title : undefined
+        const session = sessionID ? await fetchSession(sessionID) : null
+        const sessionTitle = session?.title
         const title = sessionTitle || sessionID || "unknown session"
         const message = error?.data?.message ?? error?.message
         const detail = typeof message === "string" && message !== "" ? message : undefined
 
+        const workspace = await workspaceFromSession(session)
         if (notifyOn.error)
-          await notify($, {
-            title: sessionTitle ? `Error: ${sessionTitle}` : "Error",
-            subtitle: detail,
-          })
-        await log($, `Error in session: ${title}${detail ? `: ${detail}` : ""}`, {
-          level: "error",
-          source: "opencode",
-        })
-        await showIdle()
+          await notify(
+            $,
+            {
+              title: sessionTitle ? `Error: ${sessionTitle}` : "Error",
+              subtitle: detail,
+            },
+            workspace,
+          )
+        await log(
+          $,
+          `Error in session: ${title}${detail ? `: ${detail}` : ""}`,
+          {
+            level: "error",
+            source: "opencode",
+          },
+          workspace,
+        )
+        await showIdle(workspace)
 
         if (sessionID) removeAndClose(sessionID)
         return
@@ -406,68 +476,87 @@ const createPlugin = (attachCommand: AttachCommand): Plugin => async ({ client, 
       if (e.type === "permission.asked" || e.type === "permission.updated") {
         const id = getPermissionRequestID(e.properties)
         if (id && !pendingPermissions.has(id)) {
-          pendingPermissions.add(id)
+          const workspace = await workspaceForSessionID(e.properties.sessionID)
+          pendingPermissions.set(id, workspace)
           const title = getPermissionTitle(e.properties)
-          await showNeedsInput()
+          await showNeedsInput(workspace)
           if (notifyOn.permission)
-            await notify($, { title: "Needs your permission", subtitle: title })
-          await log($, `Permission requested: ${title}`, {
-            level: "info",
-            source: "opencode",
-          })
+            await notify(
+              $,
+              { title: "Needs your permission", subtitle: title },
+              workspace,
+            )
+          await log(
+            $,
+            `Permission requested: ${title}`,
+            {
+              level: "info",
+              source: "opencode",
+            },
+            workspace,
+          )
         }
         return
       }
 
       if (e.type === "permission.replied") {
         const id = getPermissionRequestID(e.properties)
+        const workspace = id ? pendingPermissions.get(id) : undefined
         if (id) {
           pendingPermissions.delete(id)
         }
 
-        if (!isWaitingForInput()) await showRunning()
+        if (!isWaitingForInput()) await showRunning(workspace)
         return
       }
 
       if (e.type === "question.asked") {
         const id = getQuestionRequestID(e.properties)
+        const workspace = await workspaceForSessionID(e.properties.sessionID)
         if (id) {
-          pendingQuestions.add(id)
+          pendingQuestions.set(id, workspace)
         }
 
         const header = e.properties.questions?.[0]?.header ?? "Question"
-        await showNeedsInput()
+        await showNeedsInput(workspace)
         if (notifyOn.question)
-          await notify($, { title: "Has a question", subtitle: header })
-        await log($, `Question: ${header}`, { level: "info", source: "opencode" })
+          await notify($, { title: "Has a question", subtitle: header }, workspace)
+        await log($, `Question: ${header}`, { level: "info", source: "opencode" }, workspace)
         return
       }
 
       if (e.type === "question.replied" || e.type === "question.rejected") {
         const id = getQuestionRequestID(e.properties)
+        const workspace = id ? pendingQuestions.get(id) : undefined
         if (id) {
           pendingQuestions.delete(id)
         }
 
-        if (!isWaitingForInput()) await showRunning()
+        if (!isWaitingForInput()) await showRunning(workspace)
         return
       }
     },
 
     async "permission.ask"(input) {
       const id = getPermissionRequestID(input as any)
+      const workspace = await workspaceForSessionID((input as any)?.sessionID)
       if (id) {
-        pendingPermissions.add(id)
+        pendingPermissions.set(id, workspace)
       }
 
       const title = getPermissionTitle(input)
-      await showNeedsInput()
+      await showNeedsInput(workspace)
       if (notifyOn.permission)
-        await notify($, { title: "Needs your permission", subtitle: title })
-      await log($, `Permission requested: ${title}`, {
-        level: "info",
-        source: "opencode",
-      })
+        await notify($, { title: "Needs your permission", subtitle: title }, workspace)
+      await log(
+        $,
+        `Permission requested: ${title}`,
+        {
+          level: "info",
+          source: "opencode",
+        },
+        workspace,
+      )
     },
   }
 }
